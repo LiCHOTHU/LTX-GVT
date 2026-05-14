@@ -109,6 +109,72 @@ Three load-bearing tricks make this stack work:
 
 3. **Multi-view via tiling, not architecture.** For 3-view (two exteriors + wrist) consistency we tile the views into a single frame (1×3 strip) rather than adding cross-view attention. The model's existing spatial self-attention then handles inter-view consistency for free. The action prior is tiled with the same layout, each tile rendered with its own `K` and extrinsic. Cost: the model has to learn that tile seams are scene discontinuities — feasible with finetuning. Benefit: zero architectural change to LTX-2.
 
+## Training: feeding action into LTX-2
+
+Given a preprocessed sample of `(initial_image, prompt, action, context_video)` — i.e. the standard TIA2V input bundle — there are two distinct conditioning streams the GVT fine-tune introduces, and both reach the transformer via **token concatenation** along the sequence axis (MosaicMem-style). No channel concat, no architectural surgery beyond a small projector.
+
+### How LTX-2 already supports token-concat conditioning
+
+LTX-2's transformer treats every input as a single token sequence. The `Modality.latent` tensor is documented as shape `(B, T, D)` where `T` is the **total** number of tokens — *noisy + conditioning*. Each `ConditioningItem.apply_to` appends its own tokens to the end of that sequence, contributing matching `positions` `(B, 3, T_new, 2)` and `denoise_mask` `(B, T_new, 1)` entries, plus a slice of the 2-D self-attention mask `(B, T, T)`. Self-attention then mixes everything in one pass. This is the same pattern IC-LoRA and LipDub already use for their reference-video inputs.
+
+### Stream 1 — Context (rendered) video → existing IC-LoRA path, zero new code
+
+The `context_video` (the tiled 3-view Franka render produced by `build_prior.py`) is image-shaped, so it goes through the **existing** `VideoConditionByReferenceLatent` (`packages/ltx-core/src/ltx_core/conditioning/types/reference_video_cond.py`) — the same conditioning class that powers `ICLoraPipeline`'s pose-control and motion-track-control LoRAs.
+
+```
+context_video  ─►  VAE encode  ─►  patchify  ─►  reference tokens
+                                                       │
+                                                       ▼
+                            torch.cat onto the noisy-video latent sequence
+                            (with `downscale_factor` and RoPE positions
+                             produced by `get_pixel_coords`)
+```
+
+Training the model to use this stream is just **training a new IC-LoRA** with the standard upstream trainer — the prior video is the "control" input. No conditioning-code change is needed.
+
+### Stream 2 — Raw action vector → new `VideoConditionByActionTokens`
+
+The raw `(F_pixel, 8)` action stream (7 Franka joints + 1 gripper) has no pixel representation, so it cannot ride the reference-video path. GVT adds a focused new conditioning class at `packages/ltx-core/src/ltx_core/conditioning/types/action_cond.py`:
+
+```python
+from ltx_core.conditioning import ActionMLPProjector, VideoConditionByActionTokens
+
+# 1) Resample the action to the latent frame rate (one action sample per latent frame).
+#    The dataloader is responsible for this; F_latent matches the target video.
+action_resampled = ...  # (B, F_latent, 8)
+
+# 2) Project per-frame action vectors into transformer tokens.
+projector = ActionMLPProjector(action_dim=8, hidden_dim=D_HIDDEN)
+action_tokens = projector(action_resampled)  # (B, F_latent, D_hidden)
+
+# 3) Add as a conditioning item — appended to the same token sequence as the
+#    noisy video latent and the IC-LoRA reference tokens.
+conditionings.append(VideoConditionByActionTokens(tokens=action_tokens, strength=1.0))
+```
+
+`VideoConditionByActionTokens.apply_to` does three things, matching the contract of every other `ConditioningItem`:
+
+1. **Concatenates** the projected action tokens to `latent_state.latent` and `latent_state.clean_latent`.
+2. **Builds RoPE positions** `(B, 3, F_latent, 2)`: the temporal axis matches the video latent's frame timestamps (computed with the same `scale_factors.time / fps` and causal-fix convention used by `get_pixel_coords`); the height/width axes are pinned to a fixed negative sentinel `-1.0` so the action tokens are positionally distinguishable from any real video patch.
+3. **Updates `denoise_mask` and `attention_mask`** — `denoise_mask = 1 - strength` (so by default the action tokens are kept clean, never denoised); the self-attention mask is grown to `(B, T+F_latent, T+F_latent)` via the existing `update_attention_mask` helper so all video tokens attend to all action tokens and vice versa.
+
+The small projector (`ActionMLPProjector`: 2-layer SiLU MLP) lives outside the frozen base checkpoint and is trained from scratch — naturally folded into a LoRA fine-tune alongside the attention adapters.
+
+### Putting the two streams together in one training step
+
+For a batch sample `(image_0, prompt, action, context_video)`:
+
+| Stream | Tokens come from | Conditioning class | Status |
+|---|---|---|---|
+| Text prompt | Gemma text encoder → cross-attention context | existing | unchanged |
+| Initial image | First-frame keyframe latent | `VideoConditionByLatentIndex` / `VideoConditionByKeyframeIndex` | unchanged |
+| Context (rendered) video | VAE encode + patchify | `VideoConditionByReferenceLatent` (IC-LoRA) | unchanged |
+| **Raw action vector** | `ActionMLPProjector(action)` | **`VideoConditionByActionTokens` (new)** | **new in GVT** |
+
+All four streams append tokens to the same sequence; self-attention mixes them in one transformer forward pass. The training loss is computed only on the noisy video token slice (positions `[0:N_noisy]`) — every conditioning item contributes a `denoise_mask` entry of `0` so its tokens are excluded from the loss target.
+
+The smoke test in this commit verifies that, given a video latent of `(B=2, T_video=208, D=128)` and an action of `(2, 13, 8)`, the result has `latent=(2, 221, 128)`, `positions=(2, 3, 221, 2)`, correct denoise mask values for both `strength=1.0` and `strength=0.0`, monotonic temporal positions starting at `0.0`, and spatial sentinel positions at `-1.0`.
+
 ## Wrist-camera calibration (separate concern)
 
 DROID does NOT reliably ship a wrist-cam extrinsic. We recover the constant mount `T_cam_to_hand` ourselves:
