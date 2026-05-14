@@ -10,7 +10,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
-from typing import Callable, TypeVar
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 import torch
 
@@ -66,7 +66,8 @@ from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcesso
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_core.utils import find_matching_file
-from ltx_pipelines.multigpu.delegating_builder import DelegatingBuilder
+if TYPE_CHECKING:
+    from ltx_pipelines.multigpu.delegating_builder import DelegatingBuilder
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,

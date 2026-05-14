@@ -1,0 +1,22 @@
+[project]
+name = "ltx-action-cond"
+version = "0.0.1"
+description = "Action-conditioned video model on DROID for LTX-2 fine-tuning."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy>=1.14",
+    "pillow",
+]
+
+[project.optional-dependencies]
+droid = [
+    "tensorflow",
+    "tensorflow_datasets",
+    "imageio[ffmpeg]",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"

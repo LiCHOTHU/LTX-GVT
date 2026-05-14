@@ -1,123 +1,127 @@
-# LTX-2
+# GVT — Generative Virtual Teleoperation
 
-[![Website](https://img.shields.io/badge/Website-LTX-181717?logo=google-chrome)](https://ltx.io)
-[![Model](https://img.shields.io/badge/HuggingFace-Model-orange?logo=huggingface)](https://huggingface.co/Lightricks/LTX-2.3)
-[![Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAFKADAAQAAAABAAAAFAAAAACy3fD9AAACmElEQVQ4Ea1VP2haYRA/fRo0mESRIIqb2IwxuNUl0CGFQBC6OAWcikMottCpqYtDQIgdQsBFhAjZqiQhbhmySJBOgmNU0EGCg9r61Bivd0ffoykE0iQH37/77n7f3e/uqQFIPB7P/N3d3QeDwfAFEedZ91ghnyH5JM1m87dWq6UavF6vdTKZfDcajW/p4rE49+wIFMj33Gq1vlNo+kxg758KpiETqP/29vaXweVyqaS0aBfPXEfGFwTjWCwM+KBQoWA4HAJx/KDNvxcmTTGbzYAH8SljOp2C2+2GjY0NqNfrcHFxAXNzc2LDfCuKIq78KBdFOwsgGzidTnA4HHBzcwO9Xg8sFgtsbm7C3t4eVCoVaDQa0O12YXl5GUwmk5z5cZ/PB6PRCNrttgADFQUXFhbw8PAQVVXF3d1dJAeMx+P0zn0Jh8OYz+eRADCRSGAqlcLxeIz7+/u4tLSEjKUDZrNZ8U4mk0jR4fr6Op6enoru+voa0+k0rq2tYTAYxE6ng9QiSLRgrVZDv9+PFLkA6kUhT+GEC8C8XF5ewtHRkejICShiaDabwPvj42NJm3k7ODiQdDl9Fr0ocqJpdXUVIpEIdz7Y7XZRr6ysQDQahXK5LORvbW1p5rC9vQ2UifAooBqHuVxO0vt72tnZwWq1qqtisRgWCgU5ZzIZPDk50fdUUEmZvxTmAgKBgAxunT/fJpRKJWmhUCgEVDi4uroSG46kWCzC4uKitNVgMICzszOhSgA5fiJZhp4Lbbh1KARpbF65D/lx3vMdP05Vlkf5zKIDyukFJi7N6AVwNAhVsdlsM+LsjaZ56sq8kyQUqs4P6rsAKV49B4x4Padf7Y9Kv9+fEmiBQH8S4Gsa5v8EHpL9VwL7xH8BvwEcd4ccVf02KQAAAABJRU5ErkJggg==)](https://console.ltx.video/playground)
-[![Paper](https://img.shields.io/badge/Paper-PDF-EC1C24?logo=adobeacrobatreader&logoColor=white)](https://arxiv.org/abs/2601.03233)
-[![Discord](https://img.shields.io/badge/Join-Discord-5865F2?logo=discord)](https://discord.gg/ltxplatform)
+A research fork of [Lightricks/LTX-2](./ltx_readme.md) that turns LTX-2 from a text+image-to-video model into an **action-conditioned, multi-view world model** for robotic manipulation. The model takes a *text instruction*, an *initial image*, and a *robot action stream* and generates a video of the robot executing that action — so the operator effectively "teleoperates in a generated world."
 
-**LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
+> Upstream LTX-2 docs are preserved in [`ltx_readme.md`](./ltx_readme.md). This file describes only the GVT-specific work.
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/4414adc0-086c-43de-b367-9362eeb20228" width="70%" poster=""> </video>
-</div>
+## What's new on top of LTX-2
 
-## 🚀 Quick Start
+- **TIA2V conditioning** — Text + Initial-image + Action → Video. The action stream is a sequence of Franka commanded joint angles + gripper, drawn from the [DROID](https://droid-dataset.github.io/) dataset.
+- **Multi-view output** — two fixed exterior cameras (ZED 2 stereo rig) + one wrist camera (ZED Mini). Views are tiled into a single canvas so the model's existing spatial attention enforces cross-view consistency without any architecture change (the "tiling trick" — see [Design tricks](#design-tricks)).
+- **A render-based action prior** — every action step is materialised as a per-frame *visual prior*: run forward kinematics on the commanded joints, project the Franka skeleton (Stage 1) or render the textured Franka mesh (Stage 2) into the calibrated camera, and feed that as an extra conditioning channel. This grounds the model on *where the arm should be* at every timestep, in image space.
 
-```bash
-# Clone the repository
-git clone https://github.com/Lightricks/LTX-2.git
-cd LTX-2
+## Repository layout (GVT additions)
 
-# Set up the environment
-uv sync --frozen
-source .venv/bin/activate
+```
+packages/ltx-action-cond/         # Reusable library
+  src/ltx_action_cond/
+    kinematics.py                 # Franka Panda FK (Modified DH, no URDF needed for keypoints)
+    calibration.py                # Parse the April 2025 DROID calibration JSONs
+    projection.py                 # 3D base-frame points -> image pixels
+    rendering.py                  # Stage 1: draw skeleton on a PIL image
+    mesh_rendering.py             # Stage 2: pyrender Franka meshes (mask + photoreal modes)
+    wrist_render.py               # Synthetic wrist-cam render via plane-warp + FK
+    droid.py                      # RLDS episode loading + match to calibration map
+
+experiments/droid_action_cond/    # End-to-end runner scripts (see below)
+
+ltx_readme.md                     # Upstream LTX-2 README
 ```
 
-### Required Models
+The `ltx-action-cond` package is imported as `ltx_action_cond` and exposes the small surface area needed to build the prior:
 
-Download the following models from the [LTX-2.3 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.3):
+```python
+from ltx_action_cond import (
+    fk, fk_urdf,                  # Franka forward kinematics
+    project_points,               # 3D base-frame -> 2D pixel
+    draw_skeleton,                # Stage 1 overlay
+    extrinsic_6dof_to_matrix,
+    intrinsics_to_K, rescale_K,   # DROID calibration helpers
+)
+from ltx_action_cond.mesh_rendering import FrankaMeshRenderer  # Stage 2
+```
 
-**LTX-2.3 Model Checkpoint** (choose and download one of the following)
-  * [`ltx-2.3-22b-dev.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-22b-dev.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
-  * [`ltx-2.3-22b-distilled-1.1.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-22b-distilled-1.1.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-1.1.safetensors)
+## How we capture the context (prior pipeline)
 
-**Spatial Upscaler** - Required for current two-stage pipeline implementations in this repository
-  * [`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors)
-  * [`ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors)
+Each DROID episode is turned into a parallel `(GT video, action vector, per-frame visual prior)` triple. The pipeline lives entirely in `experiments/droid_action_cond/` and runs in two stages because TensorFlow (used to read DROID's RLDS shards) and pyrender (EGL/CUDA-backed) cannot share a process — they segfault on shutdown.
 
-**Temporal Upscaler** - Supported by the model and will be required for future pipeline implementations
-  * [`ltx-2.3-temporal-upscaler-x2-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-temporal-upscaler-x2-1.0.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-temporal-upscaler-x2-1.0.safetensors)
+### Step 1 — pick an episode
 
-**Distilled LoRA** - Required for current two-stage pipeline implementations in this repository (except DistilledPipeline, ICLoraPipeline, and LipDubPipeline)
-  * [`ltx-2.3-22b-distilled-lora-384-1.1.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors)
+`pick_episode.py` walks the DROID-100 calibration index, keeps only episodes whose published *IoU* (extrinsic confidence) clears a threshold, picks one fixed exterior camera, and writes everything downstream needs:
 
-**Gemma Text Encoder** (download all assets from the repository)
-  * [`Gemma 3`](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/tree/main)
+```
+outputs/
+  meta.json           # episode_id, camera_serial/role, n_steps, IoU
+  episode.npz         # cmd_joint_position (T,7), cmd_gripper_position (T,),
+                      # action (T,7), gt_frames (T,H,W,3),
+                      # K_rls (3,3) rescaled to RLDS 320x180, cam2base (4,4)
+  01_gt/ovr_NNNN.png  # GT frames
+```
 
-**LoRAs**
-  * [`LTX-2.3-22b-IC-LoRA-Union-Control`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) - [Download](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors)
-  * [`LTX-2.3-22b-IC-LoRA-Motion-Track-Control`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control) - [Download](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control/resolve/main/ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors)
-  * [`LTX-2-19b-IC-LoRA-Detailer`](https://huggingface.co/Lightricks/LTX-2-19b-IC-LoRA-Detailer) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-IC-LoRA-Detailer/resolve/main/ltx-2-19b-ic-lora-detailer.safetensors)
-  * [`LTX-2-19b-IC-LoRA-Pose-Control`](https://huggingface.co/Lightricks/LTX-2-19b-IC-LoRA-Pose-Control) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-IC-LoRA-Pose-Control/resolve/main/ltx-2-19b-ic-lora-pose-control.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Dolly-In`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Dolly-Left`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Left) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Left/resolve/main/ltx-2-19b-lora-camera-control-dolly-left.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Dolly-Out`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out/resolve/main/ltx-2-19b-lora-camera-control-dolly-out.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Dolly-Right`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Right) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Right/resolve/main/ltx-2-19b-lora-camera-control-dolly-right.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Jib-Down`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Down) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Down/resolve/main/ltx-2-19b-lora-camera-control-jib-down.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Jib-Up`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Up) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Up/resolve/main/ltx-2-19b-lora-camera-control-jib-up.safetensors)
-  * [`LTX-2-19b-LoRA-Camera-Control-Static`](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Static) - [Download](https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Static/resolve/main/ltx-2-19b-lora-camera-control-static.safetensors)
-  * [`LTX-2.3-22b-IC-LoRA-HDR`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-HDR) - HDR IC-LoRA and pre-computed text embeddings for `HDRICLoraPipeline`
-  * [`LTX-2.3-22b-IC-LoRA-LipDub`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub) - [Download](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub/resolve/main/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors)
+Action representation used everywhere downstream: **7-D commanded joints + 1-D commanded gripper**. Cartesian EE (the top-level RLDS `action`) is kept only as a sanity check — we compare the FK-derived flange pixel against the projected Cartesian target at `t=0` to verify the extrinsic.
 
-### Available Pipelines
+### Step 2 — build the per-frame prior
 
-* **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Production-quality text/image-to-video with 2x upsampling (recommended)
-* **[TI2VidTwoStagesHQPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages_hq.py)** - Same two-stage flow as above but uses the res_2s second-order sampler (fewer steps, better quality)
-* **[TI2VidOneStagePipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_one_stage.py)** - Single-stage generation for quick prototyping
-* **[DistilledPipeline](packages/ltx-pipelines/src/ltx_pipelines/distilled.py)** - Fastest inference with 8 predefined sigmas
-* **[ICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/ic_lora.py)** - Video-to-video and image-to-video transformations (uses distilled model.)
-* **[KeyframeInterpolationPipeline](packages/ltx-pipelines/src/ltx_pipelines/keyframe_interpolation.py)** - Interpolate between keyframe images
-* **[A2VidPipelineTwoStage](packages/ltx-pipelines/src/ltx_pipelines/a2vid_two_stage.py)** - Audio-to-video generation conditioned on an input audio file
-* **[RetakePipeline](packages/ltx-pipelines/src/ltx_pipelines/retake.py)** - Regenerate a specific time region of an existing video
-* **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video with HDR output (linear float frames via LogC3 inverse decode, suitable for EXR export and tonemapping)
-* **[LipDubPipeline](packages/ltx-pipelines/src/ltx_pipelines/lipdub.py)** - Lip dubbing, rephrasing, matching speaker identity (distilled model, single IC-LoRA, Two stages).
+`build_prior.py` consumes `episode.npz` and writes both stages of the action-conditioning prior:
 
-### ⚡ Optimization Tips
+| Output dir | Stage | Source | What it is |
+|---|---|---|---|
+| `02_context/ctx_NNNN.png` | 1 | `fk(joints[t]) → project_points → draw_skeleton` | **Skeleton on black — this is the actual model input** |
+| `03_overlay/ovr_NNNN.png` | 1 | same, drawn onto GT | Sanity overlay (visually confirms FK + extrinsic) |
+| `04_context_mesh/cmsh_NNNN.png` | 2a | `FrankaMeshRenderer(mode="mask")` | Per-link flat-color mesh on black |
+| `05_overlay_mesh/omsh_NNNN.png` | 2a | mask blended on GT | Sanity overlay |
+| `06_context_photo/cpho_NNNN.png` | 2b | `FrankaMeshRenderer(mode="photo")` | Textured Franka render on black |
+| `07_overlay_photo/opho_NNNN.png` | 2b | photoreal blended on GT | Sanity overlay |
+| `prior_report.json` | — | — | Geometry stats, render ms/frame, flange-vs-cart pixel error |
 
-* **Use DistilledPipeline** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2)
-* **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. For Hopper GPUs with TensorRT-LLM, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
-* **Install attention optimizations** - Use xFormers (`uv sync --extra xformers`) or [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) for Hopper GPUs
-* **Use gradient estimation** - Reduce inference steps from 40 to 20-30 while maintaining quality (see [pipeline documentation](packages/ltx-pipelines/README.md#denoising-loop-optimization))
-* **Skip memory cleanup** - If you have sufficient VRAM, disable automatic memory cleanup between stages for faster processing
-* **Choose single-stage pipeline** - Use `TI2VidOneStagePipeline` for faster generation when high resolution isn't required
+The mesh renderer (`mesh_rendering.py`) drives finger displacement from the commanded gripper signal: `q_finger = (1 − gripper_position) · 0.04 m`, mirrored per finger (DROID convention: 0 = open, 1 = closed). When the commanded gripper saturates short of mechanical close, `droid.resolve_gripper_signal` falls back to the observed signal *for visualization only*; the model input is always commanded.
 
-## ✍️ Prompting for LTX-2
+### Step 3 — scale up
 
-When writing prompts, focus on detailed, chronological descriptions of actions and scenes. Include specific movements, appearances, camera angles, and environmental details - all in a single flowing paragraph. Start directly with the action, and keep descriptions literal and precise. Think like a cinematographer describing a shot list. Keep within 200 words. For best results, build your prompts using this structure:
+- `demo_more_episodes.py` and `headline_diverse.py` repeat the pipeline across many IoU-calibrated episodes spanning multiple labs / camera serials, in a two-pass `--extract` (TF) / `--render` (pyrender) flow.
+- `headline_both_cams.py` handles the case where only ONE of the rig's two exterior cameras has a calibrated extrinsic in a given episode: it estimates the rig geometry `T_other_to_own` from *sibling episodes* (same lab, same camera pair) and composes it with the calibrated camera's extrinsic to recover the second view.
+- `extra_videos.py` and `make_summary.py` produce headline videos and a human-readable `outputs/` tree for sharing.
 
-- Start with main action in a single sentence
-- Add specific details about movements and gestures
-- Describe character/object appearances precisely
-- Include background and environment details
-- Specify camera angles and movements
-- Describe lighting and colors
-- Note any changes or sudden events
+### Step 4 — the wrist camera
 
-For additional guidance on writing a prompt please refer to <https://ltx.video/blog/how-to-prompt-for-ltx-2>
+DROID does NOT reliably ship a wrist-camera extrinsic. We recover the constant mount `T_cam_to_hand` ourselves:
 
-### Automatic Prompt Enhancement
+1. `calibrate_wrist_vggt.py` — feed `(ext1_t0, wrist_t0)` to [VGGT](https://github.com/facebookresearch/vggt) to get the relative wrist-to-ext1 pose. VGGT returns translations *up to scale*.
+2. `wrist_calib_scale_iprl.py` / `calibrate_wrist_vggt_v2.py` — apply two scale-fixing strategies:
+   - **Focal-anchored:** `scale = K_true_fx / K_vggt_fx` (rotation is scale-invariant; we only scale the translation).
+   - **FK-anchored (v2, preferred):** feed VGGT a *third* image `wrist[t_far]` and use the FK-known hand motion `|hand[t_far] − hand[0]|` as a direct metric anchor. Avoids the failure mode where the wrist mount offset is comparable to the hand-to-camera distance.
+3. `wrist_calib_validate.py` — render `wrist[0]` from a plane-warp of `ext1[0]` using the recovered `T_cam_to_hand` and visually compare to the GT wrist frame.
+4. `wrist_demo.py` / `wrist_video_iprl.py` / `wrist_video_from_wrist0.py` — produce per-episode wrist videos by warping the scene plane through the FK-driven wrist trajectory.
 
-LTX-2 pipelines support automatic prompt enhancement via an `enhance_prompt` parameter.
+## Design tricks
 
-## 🔌 ComfyUI Integration
+Three load-bearing tricks make this stack work:
 
-To use our model with ComfyUI, please follow the instructions at <https://github.com/Lightricks/ComfyUI-LTXVideo/>.
+1. **Joint-space conditioning, not Cartesian.** We render the prior from the 7-D commanded joints, not the top-level Cartesian RLDS action. Joint commands are what the controller actually executes; the Cartesian field is only the high-level target and is one IK step removed from physical truth. We keep Cartesian around purely as a calibration sanity-check (flange-vs-cart pixel error at `t=0`).
 
-## 📦 Packages
+2. **Action-as-render conditioning.** Instead of feeding the action as a raw 8-D vector concatenated to the latents (which the model has to learn to relate to image space), we *render* it: FK → project → image-space skeleton/mesh. The action arrives in the same coordinate system as the image, so the model only has to learn "match the pose hint," not "translate joint angles to pixel locations." This is why the Stage 2 mesh prior is preferred over the Stage 1 skeleton — it occupies the same image footprint the GT arm does.
 
-This repository is organized as a monorepo with three main packages:
+3. **Multi-view via tiling, not architecture.** For 3-view (two exteriors + wrist) consistency we tile the views into a single frame (1×3 strip) rather than adding cross-view attention. The model's existing spatial self-attention then handles inter-view consistency for free. The action prior is tiled with the same layout, each tile rendered with that view's own `K` and extrinsic. Cost: the model has to learn that tile seams are scene discontinuities — feasible with finetuning. Benefit: zero architectural change to LTX-2.
 
-* **[ltx-core](packages/ltx-core/)** - Core model implementation, inference stack, and utilities
-* **[ltx-pipelines](packages/ltx-pipelines/)** - High-level pipeline implementations for text-to-video, image-to-video, and other generation modes
-* **[ltx-trainer](packages/ltx-trainer/)** - Training and fine-tuning tools for LoRA, full fine-tuning, and IC-LoRA
+## Calibration board (separate utility)
 
-Each package has its own README and documentation. See the [Documentation](#-documentation) section below.
+The wrist-camera intrinsics can also be calibrated from scratch using `calibration/generate_charuco_5x7_A4.py`, which writes a print-ready A4 ChArUco PDF (`DICT_5X5_100`, 35 mm squares, 26 mm markers). Print at 100% / "Actual size" — do not let the printer "fit to page" — and verify a square edge with a ruler before using. The `calibration/` folder is `.gitignore`d.
 
-## 📚 Documentation
+## Environment
 
-Each package includes comprehensive documentation:
+The GVT code reuses the upstream LTX-2 environment (`uv sync --frozen`) plus the `droid` extra of `ltx-action-cond`:
 
-* **[LTX-Core README](packages/ltx-core/README.md)** - Core model implementation, inference stack, and utilities
-* **[LTX-Pipelines README](packages/ltx-pipelines/README.md)** - High-level pipeline implementations and usage guides
-* **[LTX-Trainer README](packages/ltx-trainer/README.md)** - Training and fine-tuning documentation with detailed guides
+```bash
+uv sync --frozen
+uv pip install -e packages/ltx-action-cond[droid]
+```
+
+Hardware: the GVT renders + LTX-2 inference both target a single RTX 5090 (32 GB). Pyrender is currently the throughput bottleneck of the prior; the planned acceleration path is Warp/Newton for full-DROID-scale dataset construction.
+
+## Status
+
+- ✅ Stage 1 + Stage 2 prior on calibrated DROID-100 exterior episodes
+- ✅ Two-camera headline (one calibrated + one rig-inferred)
+- ✅ Wrist-cam `T_cam_to_hand` via VGGT (FK-anchored scale)
+- ⏳ Dataset assembly (action + multi-view tiled GT + tiled prior) for LTX-2 fine-tuning
+- ⏳ LTX-2 fine-tune with the tiled action-conditioning channel

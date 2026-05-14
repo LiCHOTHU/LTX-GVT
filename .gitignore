@@ -47,3 +47,11 @@ tmp
 
 # Binary files
 *.so
+
+# Generated experiment outputs (any depth)
+**/outputs/
+*.npz
+
+# Local-only (vendored deps + scratch artifacts, not source)
+/third_party/
+/calibration/
