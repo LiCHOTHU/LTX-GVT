@@ -45,6 +45,10 @@ tmp
 !packages/ltx-pipelines/tests/assets/expected_hdr_ic_lora_exr/frame_*.exr
 !packages/ltx-pipelines/tests/assets/hdr_ic_lora_test_input.mp4
 
+# GVT README assets (tracked despite the global *.png / *.mp4 ignores above)
+!docs/media/*.png
+!docs/media/*.mp4
+
 # Binary files
 *.so
 
