@@ -429,6 +429,174 @@ def render_wrist_scene_splat(
     return rgb, depth
 
 
+def render_wrist_scene_splat_vec(
+    scene: SceneCloud,
+    T_wrist_to_base: np.ndarray,
+    K_wrist: np.ndarray,
+    out_size: tuple[int, int],
+    *,
+    point_radius_px: int = 2,
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised-disk variant of `render_wrist_scene_splat`.
+
+    Same projection, same z-buffer semantics. The 29-iteration (du, dv) disk
+    loop is fused into one broadcast over a precomputed (D, 2) offset table,
+    so all D disk pixels per point are written by a single `np.add.at`-style
+    scatter. Pixel output is identical to the loop variant up to back-to-front
+    paint order.
+    """
+    W, H = out_size
+    base_to_wrist = np.linalg.inv(T_wrist_to_base)
+    pts = scene.points_base
+    if pts.shape[0] == 0:
+        return (np.full((H, W, 3), bg_color, np.uint8),
+                np.zeros((H, W), np.float32))
+
+    Ph = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)
+    Pc = (base_to_wrist @ Ph.T).T[:, :3]
+    front = Pc[:, 2] > 1e-3
+    if not front.any():
+        return (np.full((H, W, 3), bg_color, np.uint8),
+                np.zeros((H, W), np.float32))
+    Pc = Pc[front]; cols = scene.colors[front]
+    uvw = (K_wrist @ Pc.T).T
+    u = uvw[:, 0] / uvw[:, 2]
+    v = uvw[:, 1] / uvw[:, 2]
+    z = Pc[:, 2]
+    iu = np.round(u).astype(np.int32)
+    iv = np.round(v).astype(np.int32)
+    in_bounds = (iu >= -point_radius_px) & (iu < W + point_radius_px) \
+                & (iv >= -point_radius_px) & (iv < H + point_radius_px)
+    iu = iu[in_bounds]; iv = iv[in_bounds]
+    cols = cols[in_bounds]; z = z[in_bounds]
+
+    # Sort N points back-to-front FIRST (cheap: 57K elements, not 1.7M)
+    # so that the (N, D) explosion preserves back-to-front row order and
+    # `arr[flat] = vals` does last-write-wins on the closer points.
+    order = np.argsort(-z)
+    iu = iu[order]; iv = iv[order]
+    cols = cols[order]; z = z[order]
+
+    # Precompute disk offsets (D, 2) -- D=29 for r=3
+    r = point_radius_px
+    offs = np.array(
+        [(du, dv) for du in range(-r, r + 1) for dv in range(-r, r + 1)
+         if du * du + dv * dv <= r * r],
+        dtype=np.int32,
+    )
+    D = offs.shape[0]
+
+    # Broadcast points x offsets -> (N, D)
+    NU = iu[:, None] + offs[None, :, 0]
+    NV = iv[:, None] + offs[None, :, 1]
+    m = (NU >= 0) & (NU < W) & (NV >= 0) & (NV < H)
+    flat = (NV * W + NU)[m]  # row-major: all 29 disk px of pt 0, then pt 1, etc.
+    cols_b = np.broadcast_to(cols[:, None, :], (cols.shape[0], D, 3))[m]
+    z_b = np.broadcast_to(z[:, None], (z.shape[0], D))[m]
+
+    rgb = np.full((H * W, 3), bg_color, dtype=np.uint8)
+    depth = np.zeros((H * W,), dtype=np.float32)
+    rgb[flat] = cols_b      # NumPy 1D last-write-wins: closer pts overwrite
+    depth[flat] = z_b
+    return rgb.reshape(H, W, 3), depth.reshape(H, W)
+
+
+_GPU_OFFSET_CACHE: dict = {}
+
+
+def render_wrist_scene_splat_gpu(
+    scene: SceneCloud,
+    T_wrist_to_base: np.ndarray,
+    K_wrist: np.ndarray,
+    out_size: tuple[int, int],
+    *,
+    point_radius_px: int = 2,
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+    device: str = "cuda",
+    _scene_cache: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """torch/CUDA splat. Vectorised disk offsets, scene resident on GPU.
+
+    For best throughput across many frames, pass a `_scene_cache` dict (it is
+    populated on first call and reused; only depends on `scene` identity).
+    Otherwise the scene tensors are re-uploaded each call.
+    """
+    import torch
+
+    W, H = out_size
+    pts_n = scene.points_base.shape[0]
+    if pts_n == 0:
+        return (np.full((H, W, 3), bg_color, np.uint8),
+                np.zeros((H, W), np.float32))
+
+    # Cache scene tensors on GPU (re-upload only if scene identity changes).
+    # Points held in float64 to match the baseline projection rounding.
+    if _scene_cache is None or _scene_cache.get("id") != id(scene):
+        pts_t = torch.from_numpy(scene.points_base).to(device=device, dtype=torch.float64)
+        cols_t = torch.from_numpy(scene.colors).to(device=device, dtype=torch.uint8)
+        Ph_t = torch.cat([pts_t, torch.ones(pts_n, 1, device=device, dtype=torch.float64)], dim=1)
+        if _scene_cache is not None:
+            _scene_cache.clear()
+            _scene_cache.update({"id": id(scene), "Ph": Ph_t, "cols": cols_t})
+    else:
+        Ph_t = _scene_cache["Ph"]
+        cols_t = _scene_cache["cols"]
+
+    key = (point_radius_px, device)
+    if key not in _GPU_OFFSET_CACHE:
+        r = point_radius_px
+        offs_np = np.array(
+            [(du, dv) for du in range(-r, r + 1) for dv in range(-r, r + 1)
+             if du * du + dv * dv <= r * r],
+            dtype=np.int64,
+        )
+        _GPU_OFFSET_CACHE[key] = torch.from_numpy(offs_np).to(device)
+    offs_t = _GPU_OFFSET_CACHE[key]
+    D = offs_t.shape[0]
+
+    T_b2w = torch.from_numpy(np.linalg.inv(T_wrist_to_base)).to(
+        device=device, dtype=torch.float64,
+    )
+    K_t = torch.from_numpy(K_wrist).to(device=device, dtype=torch.float64)
+
+    Pc = (T_b2w @ Ph_t.T).T[:, :3]
+    z = Pc[:, 2]
+    front = z > 1e-3
+    Pc = Pc[front]
+    cols_f = cols_t[front]
+    z = z[front]
+    if Pc.shape[0] == 0:
+        return (np.full((H, W, 3), bg_color, np.uint8),
+                np.zeros((H, W), np.float32))
+
+    uvw = (K_t @ Pc.T).T
+    u = uvw[:, 0] / uvw[:, 2]
+    v = uvw[:, 1] / uvw[:, 2]
+    iu = torch.round(u).to(torch.int64)
+    iv = torch.round(v).to(torch.int64)
+
+    # Sort N points back-to-front FIRST (so the post-explosion last-write-wins
+    # at duplicate flat indices resolves to the closer point).
+    order = torch.argsort(-z, stable=True)
+    iu = iu[order]; iv = iv[order]; cols_f = cols_f[order]; z = z[order]
+
+    NU = iu[:, None] + offs_t[None, :, 0]
+    NV = iv[:, None] + offs_t[None, :, 1]
+    mask = (NU >= 0) & (NU < W) & (NV >= 0) & (NV < H)
+    flat = (NV * W + NU)[mask]
+    cols_b = cols_f[:, None, :].expand(-1, D, -1)[mask]
+    z_b = z[:, None].expand(-1, D)[mask]
+
+    bg = torch.tensor(bg_color, device=device, dtype=torch.uint8)
+    rgb = bg.expand(H * W, 3).clone()
+    depth = torch.zeros(H * W, device=device, dtype=torch.float32)
+    rgb[flat] = cols_b           # back-to-front order via row-major flatten
+    depth[flat] = z_b.to(torch.float32)
+    return (rgb.reshape(H, W, 3).cpu().numpy(),
+            depth.reshape(H, W).cpu().numpy())
+
+
 def render_wrist_via_plane_homography(
     ext1_img: np.ndarray,
     K_ext1: np.ndarray,

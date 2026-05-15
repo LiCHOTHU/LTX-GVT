@@ -37,8 +37,7 @@ from ltx_action_cond.mesh_rendering import FrankaMeshRenderer  # noqa: E402
 from ltx_action_cond.motion_flow import flow_from_joints_for_view, flow_to_rgb  # noqa: E402
 from ltx_action_cond.wrist_render import (  # noqa: E402
     NOMINAL_T_CAM_TO_HAND,
-    reconstruct_scene_from_plane,
-    render_wrist_scene_splat,
+    render_wrist_via_plane_homography,
 )
 
 WRIST_CALIB_DIR = Path(__file__).parent / "outputs" / "wrist_calib_vggt"
@@ -186,23 +185,22 @@ def process_episode(ep_dir: Path, renderer: FrankaMeshRenderer) -> None:
 
     # --- 2. Per-view renders. ---
     # ext1 / ext2 : photoreal Franka mesh (Stage 2) at the fixed camera pose.
-    # wrist       : "wrist0 anchor" approach — scene reconstructed from GT wrist[0]
-    #               through the VGGT-calibrated wrist pose at t=0, then re-rendered
-    #               through the wrist pose at every frame t. Mirrors
-    #               `wrist_video_from_wrist0.py`. This is the version that matches
-    #               GT wrist[0] exactly at t=0 and stays close downstream.
-    scene = reconstruct_scene_from_plane(
-        wristf[0], K_wrist, cam2base_wrist_per_frame[0], plane_z=0.0, sample_stride=1
-    )
+    # wrist       : plane-homography, wrist[0]-anchored, VGGT-calibrated mount.
+    #               THE project default — see `gvt_wrist_render_recipe` memory and
+    #               `wrist_demo.py:264-269`. Dense, smooth, ~6 ms/frame, no GPU.
+    T_wrist0_to_base = cam2base_wrist_per_frame[0]
+    wrist0_img = wristf[0]
 
     ext1_renders, ext2_renders, wrist_renders = [], [], []
     for t in range(T):
         ext1_renders.append(renderer.render(joints[t], K1, cam2base_1, gripper_position=float(grippers[t]))[0])
         ext2_renders.append(renderer.render(joints[t], K2, cam2base_2, gripper_position=float(grippers[t]))[0])
-        scene_rgb, _ = render_wrist_scene_splat(
-            scene, cam2base_wrist_per_frame[t], K_wrist, (W, H), point_radius_px=3
+        wrist_renders.append(
+            render_wrist_via_plane_homography(
+                wrist0_img, K_wrist, T_wrist0_to_base,
+                cam2base_wrist_per_frame[t], K_wrist, (W, H), plane_z=0.0,
+            )
         )
-        wrist_renders.append(scene_rgb)
     ext1_renders = np.stack(ext1_renders, axis=0)
     ext2_renders = np.stack(ext2_renders, axis=0)
     wrist_renders = np.stack(wrist_renders, axis=0)
