@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 CALIB_DIR = Path("/home/licho/data/droid/calibration")
 DROID100 = Path("/home/licho/data/droid/droid_100/1.0.0")
-ROOT = Path(__file__).parent / "outputs" / "wrist_demo"
+ROOT = Path(__file__).parent / "outputs" / "context"
 ROOT.mkdir(parents=True, exist_ok=True)
 
 N_EPISODES = 5
@@ -171,55 +171,102 @@ def extract_pass() -> None:
         print(f"  extracted {ep_id}  T={T}")
 
 
+WRIST_CALIB_DIR = Path(__file__).parent / "outputs" / "wrist_calib_vggt"
+
+
+def _derive_T_cam_to_hand(d: dict, calib: dict) -> np.ndarray:
+    """v1-style VGGT calibration with FK-anchored scale fix (mirrors wrist_video_from_wrist0.py)."""
+    from ltx_action_cond.kinematics import fk_urdf
+    T_wrist_to_ext = np.array(calib.get("T_wrist_to_ext2", calib.get("T_wrist_to_ext1")))
+    use_ext2 = "T_wrist_to_ext2" in calib
+    cam2base_anchor = d["cam2base_2" if use_ext2 else "cam2base_1"]
+    T_hand_to_base_t0 = fk_urdf(d["cmd_joint_position"][0])["hand"]
+    T_hand_to_anchor = np.linalg.inv(cam2base_anchor) @ T_hand_to_base_t0
+    true_dist = float(np.linalg.norm(T_hand_to_anchor[:3, 3]))
+    vggt_dist = float(np.linalg.norm(T_wrist_to_ext[:3, 3]))
+    scale = true_dist / vggt_dist if vggt_dist > 1e-6 else 1.0
+    T_w_scaled = T_wrist_to_ext.copy()
+    T_w_scaled[:3, 3] *= scale
+    T_wrist_to_base_t0 = cam2base_anchor @ T_w_scaled
+    return np.linalg.inv(T_hand_to_base_t0) @ T_wrist_to_base_t0
+
+
+def _load_T_cam_to_hand(ep_short: str, d: dict) -> tuple[np.ndarray, str]:
+    """Load the VGGT-calibrated wrist mount transform for this episode.
+
+    Prefers `<ep>_ext2anchor.json` if present (better for TRI / some labs); otherwise
+    falls back to `<ep>.json` and applies the FK-anchored scale fix in
+    :func:`_derive_T_cam_to_hand`. **Never** falls back to the nominal mount.
+    """
+    ext2_path = WRIST_CALIB_DIR / f"{ep_short}_ext2anchor.json"
+    default_path = WRIST_CALIB_DIR / f"{ep_short}.json"
+    if ext2_path.exists():
+        calib = json.loads(ext2_path.read_text())
+        return np.array(calib["T_cam_to_hand"]), "ext2-anchored"
+    if not default_path.exists():
+        raise FileNotFoundError(
+            f"VGGT wrist calibration missing for episode {ep_short}: "
+            f"neither {ext2_path.name} nor {default_path.name} exists. "
+            f"Run calibrate_wrist_vggt(_v2).py first."
+        )
+    calib = json.loads(default_path.read_text())
+    return _derive_T_cam_to_hand(d, calib), "ext1-anchored"
+
+
 def render_pass() -> None:
     import os; os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     from ltx_action_cond.mesh_rendering import FrankaMeshRenderer
     from ltx_action_cond.kinematics import fk_urdf
-    from ltx_action_cond.wrist_render import (
-        NOMINAL_T_CAM_TO_HAND, reconstruct_scene_from_plane,
-        render_wrist_scene_splat, composite_wrist_with_mesh,
-    )
+    from ltx_action_cond.wrist_render import render_wrist_via_plane_homography
 
     for ep_dir in sorted(ROOT.iterdir()):
         if not (ep_dir / "data.npz").exists(): continue
         info = json.loads((ep_dir / "info.json").read_text())
         d = np.load(ep_dir / "data.npz")
-        joints = d["cmd_joint_position"]; grippers = d["gripper_for_render"].reshape(-1)
+        joints = d["cmd_joint_position"]
+        # Gripper signal for the FIXED-camera Franka mesh: the resolved (obs-preferred,
+        # rescaled-to-[0,1]) signal from `resolve_gripper_signal`. This is what tracks
+        # the *actual* finger width in GT video — the rendered fingers open/close in
+        # sync with what the GT shows them doing.
+        grippers = d["gripper_for_render"].reshape(-1)
         ext1f = d["ext1_frames"]; ext2f = d["ext2_frames"]; wristf = d["wrist_frames"]
         K1 = d["K1"]; K2 = d["K2"]; K_wrist = d["K_wrist"]
         cam2base_1 = d["cam2base_1"]; cam2base_2 = d["cam2base_2"]
         T = ext1f.shape[0]
         H, W = ext1f.shape[1], ext1f.shape[2]
         Hw, Ww = wristf.shape[1], wristf.shape[2]
+        assert (W, H) == (Ww, Hw), f"viewport mismatch ext={W}x{H} wrist={Ww}x{Hw}"
         print(f"=== {info['episode_id']}  T={T} ===")
 
-        # Scene = plane warp from ext1 at t=0
-        scene = reconstruct_scene_from_plane(ext1f[0], K1, cam2base_1, plane_z=0.0,
-                                              sample_stride=1)
-        print(f"  scene: {scene.inlier_match_count} plane-warp points")
+        # === Wrist recipe (standard): anchor on GT wrist[0] + per-episode VGGT mount. ===
+        # NEVER use NOMINAL_T_CAM_TO_HAND here; load `T_cam_to_hand` from
+        # outputs/wrist_calib_vggt/<ep>.json (with FK-anchored scale fix).
+        ep_short = ep_dir.name
+        T_cam_to_hand, calib_src = _load_T_cam_to_hand(ep_short, d)
+        T_hand_to_base_0 = fk_urdf(joints[0])["hand"]
+        T_wrist0_to_base = T_hand_to_base_0 @ T_cam_to_hand
+        wrist0_img = wristf[0]
+        print(f"  wrist calib: {calib_src}")
 
-        # Single renderer for all three views (all 320x180 in DROID-100).
-        assert (W, H) == (Ww, Hw), f"viewport mismatch ext={W}x{H} wrist={Ww}x{Hw}"
+        # Fixed cameras: photoreal Franka mesh + matching gripper.
         r = FrankaMeshRenderer(size=(W, H), mode="photo")
         ext1_renders, ext2_renders, wrist_renders = [], [], []
         for t in range(T):
-            link_T = fk_urdf(joints[t])
-            T_hand_to_base = link_T["hand"]
-            T_wrist_to_base = T_hand_to_base @ NOMINAL_T_CAM_TO_HAND
-
-            c_ext1, _ = r.render(joints[t], K1, cam2base_1,
-                                  gripper_position=float(grippers[t]))
+            c_ext1, _ = r.render(joints[t], K1, cam2base_1, gripper_position=float(grippers[t]))
             ext1_renders.append(c_ext1)
-            c_ext2, _ = r.render(joints[t], K2, cam2base_2,
-                                  gripper_position=float(grippers[t]))
+            c_ext2, _ = r.render(joints[t], K2, cam2base_2, gripper_position=float(grippers[t]))
             ext2_renders.append(c_ext2)
-            # Per user: do NOT render the Franka/gripper in the wrist view.
-            # The wrist camera is mounted to the gripper, so painting the gripper
-            # on top of itself isn't useful as conditioning context. Show only
-            # the t=0 scene reprojected through the wrist camera pose.
-            scene_rgb, _ = render_wrist_scene_splat(scene, T_wrist_to_base, K_wrist, (Ww, Hw),
-                                                     point_radius_px=3)
-            wrist_renders.append(scene_rgb)
+
+            # Wrist: plane-homography from GT wrist[0] through the VGGT-calibrated
+            # wrist pose at frame t. By construction t=0 matches GT wrist[0] exactly.
+            # No Franka mesh in the wrist view — the camera is mounted on the gripper.
+            T_wrist_t_to_base = fk_urdf(joints[t])["hand"] @ T_cam_to_hand
+            wrist_renders.append(
+                render_wrist_via_plane_homography(
+                    wrist0_img, K_wrist, T_wrist0_to_base,
+                    T_wrist_t_to_base, K_wrist, (W, H), plane_z=0.0,
+                )
+            )
         r.close()
 
         # Save per-camera headline videos at 3x upscale

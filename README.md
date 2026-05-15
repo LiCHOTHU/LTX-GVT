@@ -6,12 +6,12 @@ A research fork of [Lightricks/LTX-2](./ltx_readme.md) that turns LTX-2 from a t
 
 <sub>Real DROID episode (CLVR lab). **Rows:** exterior cam 1 / exterior cam 2 / wrist cam. **Columns:** GT video frame | Franka rendered from the action stream only | rendered-on-GT sanity overlay. Middle column = the conditioning channel the model is trained on. <a href="docs/media/three_view_action_cond.mp4">▶ Watch the 12 s clip</a></sub>
 
-> Upstream LTX-2 docs are preserved in [`ltx_readme.md`](./ltx_readme.md). This file only describes the GVT-specific work.
+> Upstream LTX-2 docs are preserved in [`ltx_readme.md`](./ltx_readme.md). This file only describes the GVT-specific work. Day-to-day experiments, measurements, and dropped directions live in [`DEVLOG.md`](./DEVLOG.md).
 
 ## What's new on top of LTX-2
 
 - **TIA2V conditioning** — Text + Initial-image + Action → Video. The action stream is a sequence of Franka commanded joint angles + gripper, drawn from the [DROID](https://droid-dataset.github.io/) dataset.
-- **Multi-view output** — two fixed exterior cameras (ZED 2 stereo rig) + one wrist camera (ZED Mini). Views are tiled into a single canvas so the model's existing spatial attention enforces cross-view consistency without any architecture change (the "tiling trick" — see [Design tricks](#design-tricks)).
+- **Multi-view output** — two fixed exterior cameras (ZED 2 stereo rig) + one wrist camera (ZED Mini), tiled 2×2 (1024×576, 512×288 per tile; bottom-left is blank). Vanilla spatial attention covers cross-view consistency for free; an opt-in [PRoPE](#multi-view-geometry-optional-prope-attention) flag turns on geometry-aware attention when needed (see [Design tricks](#design-tricks)).
 - **A rendered action prior** — every action step is materialised as a per-frame *visual prior*: run forward kinematics on the commanded joints, project the Franka skeleton (Stage 1) or render the textured Franka mesh (Stage 2) into the calibrated camera, and feed that image as an extra conditioning channel. This grounds the model on *where the arm should be* at every timestep, in image space.
 
 ## Context generation — uses *only* TIA2V model inputs
@@ -53,15 +53,18 @@ The training-side pipeline lives in `experiments/droid_action_cond/`. It runs in
 
 The `prior_report.json` per episode records the flange-vs-Cartesian pixel error at `t=0` — a one-number sanity check that FK + extrinsic agree with the recorded EE target. Single-digit pixels is what we expect on a 320×180 RLDS frame.
 
-### Fixed-camera prior across diverse labs
+### How the context is rendered per view
 
-The exterior-camera prior generalises across the DROID institutions (different camera serials, mounts, table layouts) because the only per-episode quantities are the published `K` and `T_cam_to_base`; the FK and the renderer are identical everywhere. Two strips below — `[GT | Franka rendered from action only | rendered-on-GT overlay]` — built with `headline_diverse.py`:
+Each view in the 2×2 tile uses a *different* renderer because the fixed exteriors and the wrist camera have fundamentally different relationships to the robot. Both pipelines consume only the TIA2V inputs (action stream + known camera intrinsics/extrinsics + the first GT frame, which is the model's input image `I` anyway).
 
-![RAIL lab](docs/media/headline_diverse_rail.png)
-<sub>RAIL · <a href="docs/media/headline_diverse_rail.mp4">▶ 24 s clip</a></sub>
+| View | Camera pose | Renderer | What gets drawn | File |
+|---|---|---|---|---|
+| ext1, ext2 | **Static** `cam2base` from the April 2025 DROID calibration | `FrankaMeshRenderer(mode="photo")` — pyrender rasterisation of the Franka FER visual meshes | The Franka arm itself (textured mesh) on black background. Mesh pose comes from `fk_urdf(joints[t])` per frame. Gripper finger displacement = `(1 − gripper) × 0.04 m` mirrored | `packages/ltx-action-cond/src/ltx_action_cond/mesh_rendering.py` |
+| wrist | **Time-varying** `cam2base_wrist[t] = T_hand_to_base(joints[t]) @ T_cam_to_hand` where `T_cam_to_hand` is the per-episode **VGGT-calibrated** mount from `outputs/wrist_calib_vggt/<ep>.json` (NOT the nominal mount) | Scene plane-warp + splat from GT wrist[0], reprojected through the wrist pose at frame t | A reprojection of the scene that the wrist camera saw at t=0, viewed from where the wrist points at frame t. By construction t=0 matches GT wrist[0] exactly. **We do NOT render the Franka mesh in the wrist view** — the camera is rigidly attached to the gripper, so painting the gripper on itself adds nothing | `packages/ltx-action-cond/src/ltx_action_cond/wrist_render.py`: `reconstruct_scene_from_plane(wristf[0], K_wrist, cam2base_wrist[0], plane_z=0.0)` → `render_wrist_scene_splat(scene, cam2base_wrist[t], K_wrist, …)` |
 
-![AUTOLab](docs/media/headline_diverse_autolab.png)
-<sub>AUTOLab · <a href="docs/media/headline_diverse_autolab.mp4">▶ 6 s clip</a></sub>
+The wrist recipe is the load-bearing piece: anchoring on GT wrist[0] (rather than ext1[0]) and using the VGGT-calibrated `T_cam_to_hand` (rather than the nominal mount transform) are both required for the rendered view to track the GT wrist video. The reference implementation lives in `experiments/droid_action_cond/wrist_video_from_wrist0.py` and is mirrored exactly in any later demo that visualises the wrist context (e.g. `motion_flow_demo.py`).
+
+> Per-step render-time profiling, the dropped warped-noise direction, the motion-flow scaffold, and the cross-lab sanity-check demos all live in [`DEVLOG.md`](DEVLOG.md).
 
 ### Action representation
 
@@ -107,7 +110,7 @@ Three load-bearing tricks make this stack work:
 
 2. **Action-as-render, not action-as-vector.** Instead of feeding the action as a raw 8-D vector concatenated to the latents (which the model would have to learn to relate to image space), we *render* it: FK → project → image-space skeleton/mesh. The action arrives in the same coordinate system as the image, so the model only has to learn "match the pose hint," not "translate joint angles to pixel locations." This is also why the Stage 2 mesh prior is preferred over the Stage 1 skeleton — it occupies the same image footprint the GT arm does.
 
-3. **Multi-view via tiling, not architecture.** For 3-view (two exteriors + wrist) consistency we tile the views into a single frame (1×3 strip) rather than adding cross-view attention. The model's existing spatial self-attention then handles inter-view consistency for free. The action prior is tiled with the same layout, each tile rendered with its own `K` and extrinsic. Cost: the model has to learn that tile seams are scene discontinuities — feasible with finetuning. Benefit: zero architectural change to LTX-2.
+3. **Multi-view via tiling, not architecture.** For 3-view (two exteriors + wrist) consistency we tile the views into a **2×2 grid** — `[top-left: cam1 | top-right: cam2 | bottom-left: blank | bottom-right: wrist]` — at 1024×576 total (each tile 512×288, the smallest 16:9 size with each tile divisible by the VAE's ×32 spatial factor). The model's existing spatial self-attention handles inter-view consistency for free; the blank quadrant is supervised to constant black (or loss-masked). The action prior is tiled with the same layout, each tile rendered with its own `K` and extrinsic. Cost: ~25% of tokens spent on the blank quadrant; benefit: square output that matches LTX-2's training distribution and a natural slot for a 4th view (depth, second wrist, …) later. If cross-view geometric drift appears, opt into [PRoPE](#multi-view-geometry-optional-prope-attention) for explicit camera awareness.
 
 ## Training: feeding action into LTX-2
 
@@ -174,6 +177,68 @@ For a batch sample `(image_0, prompt, action, context_video)`:
 All four streams append tokens to the same sequence; self-attention mixes them in one transformer forward pass. The training loss is computed only on the noisy video token slice (positions `[0:N_noisy]`) — every conditioning item contributes a `denoise_mask` entry of `0` so its tokens are excluded from the loss target.
 
 The smoke test in this commit verifies that, given a video latent of `(B=2, T_video=208, D=128)` and an action of `(2, 13, 8)`, the result has `latent=(2, 221, 128)`, `positions=(2, 3, 221, 2)`, correct denoise mask values for both `strength=1.0` and `strength=0.0`, monotonic temporal positions starting at `0.0`, and spatial sentinel positions at `-1.0`.
+
+## Multi-view geometry: optional PRoPE attention
+
+For the 3-view (cam1 / cam2 / wrist) tiled output, vanilla spatial self-attention has no idea that the four tiles correspond to *different camera frustums* — it sees them as one 2D image. To get geometry-aware cross-view consistency for free, GVT vendors [PRoPE](https://arxiv.org/abs/2507.10496) ("Cameras as Relative Positional Encoding") and makes it an **opt-in flag**. The vanilla LTX-2 training and inference paths are byte-for-byte unchanged when PRoPE is off.
+
+### Why PRoPE and not RayRoPE
+
+[RayRoPE](https://arxiv.org/abs/2601.15275) is the obvious cousin, but it (a) replaces `scaled_dot_product_attention` itself (breaks FlashAttention compatibility) and (b) introduces a learned per-token depth head (pure cold-start parameters that the LTX-2 checkpoint cannot help). PRoPE is geometry-only — **zero learnable parameters** — and applies as a Q/K/V/O transform around standard SDPA, so we can:
+- load the stock LTX-2 checkpoint into the PRoPE-enabled module unchanged;
+- keep FlashAttention/xformers kernels;
+- adapt the spatial Q/K behaviour with a LoRA during fine-tune instead of a full retrain.
+
+### Files
+
+| Path | What it is |
+|---|---|
+| `packages/ltx-core/src/ltx_core/model/transformer/prope.py` | Vendored copy of the official PRoPE PyTorch implementation (MIT, unmodified). |
+| `packages/ltx-core/src/ltx_core/model/transformer/attention.py` | A guarded PRoPE branch in `Attention.forward`. |
+
+### Turning it on
+
+`Attention` gains five constructor flags, all defaulted so existing callsites are unchanged:
+
+```python
+Attention(
+    query_dim=..., heads=..., dim_head=...,
+    use_prope=True,                # default False — toggle PRoPE on
+    prope_patches_x=PX,            # per-tile patch grid width (e.g. 16 at 512×288)
+    prope_patches_y=PY,            # per-tile patch grid height (e.g. 9 at 512×288)
+    prope_image_width=IMG_W,       # per-tile pixel width  (used to normalise K)
+    prope_image_height=IMG_H,      # per-tile pixel height
+)
+```
+
+At forward time the per-batch camera tensors are passed in:
+
+```python
+attn(x, pe=pe, viewmats=(B, cams, 4, 4), Ks=(B, cams, 3, 3))
+```
+
+If `viewmats` is `None` (or `use_prope=False`), the call takes the vanilla path with no overhead. So a single `--use_prope` flag at the trainer level can flip every `Attention` module while keeping the rest of the dataloader / pipeline exactly the same — just make sure the dataloader provides `viewmats`/`Ks` when the flag is on.
+
+For the 2×2 tiled layout: `cams=4`, `[cam1, cam2, BLANK, wrist]`. The blank tile gets a dummy camera (e.g. identity extrinsic, identity intrinsic) and its tokens are loss-masked downstream so the model isn't penalised for whatever it puts there.
+
+### Verified properties
+
+A smoke test under `conda env ltx` confirms:
+1. `use_prope=False` constructor produces a `state_dict` with **the same 10 keys** as the pre-PRoPE module — stock LTX-2 checkpoints load unchanged.
+2. `attn(x)` and `attn(x, context=ctx)` with no `viewmats` keep the original calling conventions.
+3. Vanilla weights load into a `use_prope=True` module with `missing=[]` and `unexpected=[]` — full bidirectional checkpoint compat.
+4. `use_prope=True` with no `viewmats` passed at forward auto-falls back to the vanilla path.
+5. `use_prope=True` adds **zero learnable parameters** (paper claim verified: 16,768 == 16,768 in our minimal config).
+
+### What's left to wire up
+
+The Attention layer is ready to accept `viewmats`/`Ks`. To make the full `--use_prope` training flag actually flow these values end-to-end you still need to:
+- Add `use_prope` to `TransformerArgs` and the trainer config.
+- Extend `Modality` (or add a sibling tensor) to carry `viewmats`/`Ks` from the dataloader.
+- Thread them through the transformer's block loop into each `Attention.forward` call.
+- Train a Q/K LoRA on the resulting model to absorb the positional-encoding shift.
+
+These are mechanical (no further attention-kernel surgery) and intentionally left for the trainer integration pass.
 
 ## Wrist-camera calibration (separate concern)
 

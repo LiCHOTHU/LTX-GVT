@@ -11,6 +11,7 @@ from ltx_core.conditioning.types import (
     VideoConditionByLatentIndex,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.conditioning.warped_noise import apply_warped_noise, regaussianize
 
 __all__ = [
     "ActionMLPProjector",
@@ -22,4 +23,6 @@ __all__ = [
     "VideoConditionByKeyframeIndex",
     "VideoConditionByLatentIndex",
     "VideoConditionByReferenceLatent",
+    "apply_warped_noise",
+    "regaussianize",
 ]
