@@ -96,6 +96,9 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        # Expose acceleration config to the strategy so it can read use_prope / use_warp_latent.
+        # (Cleaner than threading them through the strategy constructor signature.)
+        self._training_strategy._acceleration_config = self._config.acceleration
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
         self._setup_accelerator()
@@ -484,6 +487,49 @@ class LtxvTrainer:
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
+        # Action condition: opt-in Stream-2 conditioning. Small MLP projects per-frame action
+        # vectors into hidden tokens that get concatenated onto the latent sequence in
+        # video_to_video.py. Lives outside the transformer / quantization stack so its weights
+        # train cleanly from scratch as part of the LoRA fine-tune.
+        self._action_projector = None
+        if self._config.acceleration.use_action_cond:
+            from ltx_core.conditioning.types.action_cond import ActionMLPProjector
+
+            # Project actions into the *transformer-input* dim (== VAE latent channels,
+            # 128 for LTX-2.x), NOT the inner hidden dim. The combined_latents in
+            # video_to_video.py live in this pre-patchify-proj space; the existing
+            # `patchify_proj` then lifts both video and action tokens to inner_dim together.
+            hidden_dim = self._transformer.patchify_proj.in_features
+            self._action_projector = ActionMLPProjector(
+                action_dim=self._config.acceleration.action_dim,
+                hidden_dim=hidden_dim,
+            ).to(dtype=transformer_dtype)
+            n_params = sum(p.numel() for p in self._action_projector.parameters())
+            logger.info(
+                f"Action-cond enabled: ActionMLPProjector({self._config.acceleration.action_dim} -> {hidden_dim}), "
+                f"{n_params:,} new trainable params"
+            )
+            # Expose the projector to the strategy so it can call it in prepare_training_inputs.
+            self._training_strategy._action_projector = self._action_projector
+
+        # PRoPE: opt-in geometry-aware attention. Swap each block's video self-attention
+        # for a PRoPE-enabled module. Zero added params -> stock checkpoint already loaded.
+        # Must happen BEFORE quantization so we modify the original modules, not the quantized ones.
+        if self._config.acceleration.use_prope:
+            from ltx_core.model.transformer.enable_prope import enable_prope_on_model
+
+            for name in ("prope_patches_x", "prope_patches_y", "prope_image_width", "prope_image_height"):
+                if getattr(self._config.acceleration, name) is None:
+                    raise ValueError(f"acceleration.{name} is required when use_prope=True")
+            n_swapped = enable_prope_on_model(
+                self._transformer,
+                patches_x=self._config.acceleration.prope_patches_x,
+                patches_y=self._config.acceleration.prope_patches_y,
+                image_width=self._config.acceleration.prope_image_width,
+                image_height=self._config.acceleration.prope_image_height,
+            )
+            logger.info(f"PRoPE enabled on {n_swapped} transformer blocks (zero added params)")
+
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":
                 raise ValueError("Quantization is not supported in full training mode.")
@@ -517,6 +563,10 @@ class LtxvTrainer:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        # Action-cond projector lives outside the transformer; add its params explicitly so
+        # the optimizer updates them. (New module, no checkpoint weights -> trains from scratch.)
+        if self._action_projector is not None:
+            self._trainable_params.extend(p for p in self._action_projector.parameters() if p.requires_grad)
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
@@ -701,6 +751,9 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
+        if self._action_projector is not None:
+            self._action_projector = self._accelerator.prepare(self._action_projector)
+            self._training_strategy._action_projector = self._action_projector
 
         # Log GPU memory usage after model preparation
         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3

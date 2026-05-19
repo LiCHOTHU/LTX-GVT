@@ -38,8 +38,9 @@ sys.path.insert(0, "packages/ltx-action-cond/src")
 
 from ltx_action_cond.kinematics import fk_urdf
 
-WRIST_ROOT = Path("experiments/droid_action_cond/outputs/wrist_demo")
-OUT_DIR = Path("experiments/droid_action_cond/outputs/wrist_calib_vggt")
+_HERE = Path(__file__).parent
+WRIST_ROOT = Path(os.environ.get("WRIST_DATA_ROOT", _HERE / "outputs" / "context"))
+OUT_DIR = Path(os.environ.get("WRIST_CALIB_OUT", _HERE / "outputs" / "wrist_calib_vggt"))
 OUT_DIR.mkdir(exist_ok=True)
 
 

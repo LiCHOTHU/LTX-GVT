@@ -41,6 +41,12 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    # PRoPE inputs — optional per-tile camera matrices for geometry-aware attention.
+    # Shapes: viewmats (B, C, 4, 4) world-to-camera, Ks (B, C, 3, 3) intrinsics.
+    # C = number of tiles/cameras in the multi-view tiled output.
+    # When None, the standard (non-PRoPE) attention path is used.
+    viewmats: torch.Tensor | None = None
+    Ks: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""

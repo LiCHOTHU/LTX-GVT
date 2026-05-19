@@ -28,6 +28,9 @@ class TransformerArgs:
     self_attention_mask: torch.Tensor | None = (
         None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
     )
+    # PRoPE inputs propagated from Modality, see modality.py for shapes/semantics.
+    viewmats: torch.Tensor | None = None
+    Ks: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -185,6 +188,8 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            viewmats=modality.viewmats,
+            Ks=modality.Ks,
         )
 
 

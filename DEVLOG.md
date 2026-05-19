@@ -6,6 +6,233 @@ Entries are in reverse chronological order.
 
 ---
 
+## 2026-05-19 — Dataset build pipeline: tiled v2v IC-LoRA + resumable orchestrator + Slurm watchdog
+
+End-to-end preprocessed dataset pipeline for the GVT trainer. Goal: take the per-chunk `data.npz` files we already render (`outputs/context_chunks_wrist_new/<ep>/chunk_NN/data.npz`), produce trainer-ready `latents/conditions/reference_latents/actions` on disk, and survive Slurm preemption arbitrarily many times without data corruption.
+
+### Three scripts landed
+
+| File | Role |
+|---|---|
+| `experiments/droid_action_cond/build_v2v_dataset.py` | One-shot builder for a hand-picked chunk list. Lanczos-upscales each view to 512×288, tiles `[ext1 \| ext2 / blank \| wrist]` into a 1024×576 MP4 pair (target + reference), dumps actions, then invokes the trainer's `process_dataset.py` to VAE+Gemma encode, plus the conditions-fix-up move. Used for the single-chunk + single-episode smoke tests. |
+| `experiments/droid_action_cond/build_dataset_resumable.py` | The production orchestrator. Same per-chunk work but wrapped in: atomic tmp+rename writes, `_done/<id>` marker files, hash-sharded parallelism, corruption detection on resume, automatic Slurm-array shard inference. |
+| `experiments/droid_action_cond/build_dataset_resumable.sbatch` | Slurm wrapper. Targets `gpu-v100,gpu-a100,gpu-h100` (preprocessing fits in ~10 GB with 8-bit Gemma — no L40S needed), `--qos=embers --requeue` for preemption, log dir at `/storage/project/.../outputs/gvt/logs/`. |
+| `experiments/droid_action_cond/monitor_dataset_build.sh` | Watchdog. Every 5 min checks `squeue` for the build job; if missing, resubmits the array. Auto-exits when `_done/` count matches total chunk count. |
+
+### Why the atomic + marker design
+
+Slurm preemption can hit at any instruction. The contract: **a chunk is either fully committed or not committed at all** — never half. The pattern:
+
+1. Build target.mp4 + reference.mp4 + the action `.pt` in a staging dir (`staging/batch_<id>/`). All file writes use `_atomic_tmp_path` (same-dir hidden file, real extension preserved) + `os.replace` (POSIX atomic rename on same FS).
+2. Invoke `process_dataset.py` on the staging dataset.json → produces VAE-encoded `.pt` files in `staging/.../precomputed/`.
+3. Verify each chunk's 4 staged `.pt` files: exists, size > 1024 bytes, **and `torch.load` succeeds** (catches truncation that POSIX rename can't).
+4. Atomic-rename each of the 4 files into final `precomputed/<source>/videos/<id>_target.pt`.
+5. Last operation: `touch _done/<id>`. Only after this does any consumer treat the chunk as done.
+
+If we crash anywhere in 1–4, the next launch sees no marker → enumerates the chunk as pending → `clean_partial_outputs()` wipes leftovers → rebuilds.
+
+### Tripwire: the MP4 atomic-write extension trap
+
+First version of `_atomic_tmp_path` used `path.with_suffix(path.suffix + ".tmp.PID")`, yielding `foo.mp4.tmp.12345`. Imageio's plugin dispatcher sniffs the trailing extension to pick a codec — for `.12345` it falls through to the TIFF plugin, which then explodes on the `fps` kwarg. The 2-chunk smoke surfaced this immediately. Fix: rotate the suffix order to `.foo.tmp.12345.mp4` so `.mp4` stays last and the dispatch is correct.
+
+### Corruption recovery — explicitly tested
+
+We injected two failure modes into a freshly-committed test directory:
+
+1. Truncated a committed `latents/.../<id>.pt` to `"garbage"` (8 bytes) while leaving its marker in place.
+2. Removed an `<id>`'s marker plus its conditions+actions `.pt` files but left the latents+reference files (= what a kill-mid-commit produces).
+
+On the next run:
+- For (1), `chunk_is_done()` calls `_output_looks_valid()` which does a `torch.load` and catches the `UnpicklingError` → logs `[REVIVE]` → wipes the marker and all 4 partials → next batch rebuilds, post-commit verifies all 4 `.pt` files load with the correct shapes.
+- For (2), the marker-absent state enumerates the chunk as pending. Before the rebuild's renames, `clean_partial_outputs()` removes the leftover `.pt` files so partials never coexist with the fresh writes.
+
+Verified: both chunks come back to a fully-loadable state with the right tensor shapes (`latents: (128, 5, 18, 32)`, `conditions: (1024, 4096)`, `actions: (33, 8)`).
+
+### Slurm parallelism via hash-shard
+
+`build_dataset_resumable.py --shard i/N` selects chunks where `sha1(chunk_id)[:8] % N == i`. No coordination between workers — atomic file writes + per-chunk markers mean two workers can't corrupt each other's output even if they ever raced on the same chunk (which the hash-mod assignment prevents anyway). The sbatch auto-detects `SLURM_ARRAY_TASK_ID/COUNT` so `sbatch --array=0-7` spawns 8 stable shards with zero hand-holding.
+
+### Timing (CLVR episode, 6 chunks, warm cache)
+
+| Stage | Wall time | Per-chunk |
+|---|---|---|
+| Tile MP4s + action dump + dataset.json | 7.8 s | 1.3 s |
+| `process_dataset.py` (VAE encode 12 videos + Gemma embed 6 captions) | 29.9 s | 5.0 s |
+| **Total** | **37.7 s** | **6.3 s** |
+
+Cold-load first-run on a fresh node: ~5–8 min for the model + VAE shards off `cedar0` (paid once per Slurm job, not per episode).
+
+### GPU sizing — preprocessing does NOT need L40S
+
+Process_dataset.py loads Gemma + LTX VAE only (not the 22B transformer — that's training-only). With `--load_text_encoder_in_8bit` the budget drops to **~10 GB**, well within V100-32G / A10-24G / A100-40G. The sbatch's partition list `gpu-v100,gpu-a100,gpu-h100` is intentional: short queues, lots of slots. Training still wants ≥32 GB and we'll target L40S there.
+
+### Disk and dataset scale
+
+The per-chunk artifact for our 1024×576×33 tile layout breaks down as:
+
+| Source | Size per chunk | What it is |
+|---|---|---|
+| `latents/<id>_target.pt` | ~740 KB | `(128, 5, 18, 32)` bf16 |
+| `reference_latents/<id>_target.pt` | ~740 KB | same |
+| `conditions/<id>_target.pt` | **~8 MB** | Gemma `(1024, 4096)` bf16 + masks + audio embeds |
+| `actions/<id>_target.pt` | ~1 KB | `(33, 8)` fp32 |
+| **Total per chunk** | **~9 MB** | |
+
+So an episode of 6 chunks lands at ~55 MB. CLVR built today is 83 MB on disk including the raw source MP4s (which are debug-only and can be dropped to save ~10 MB/episode).
+
+The conditions file is the disk-bloat outlier: it's the same Gemma embedding for every chunk of a given episode, redundantly stored. A caption-dedup post-process (hash-keyed symlinks) would cut this from 8 MB × N chunks to 8 MB × N unique captions — ~85% disk reduction at scale. Documented as a follow-up, not implemented today.
+
+### Outputs
+
+- `/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/gvt_dataset_full/` (default sbatch out_root, intended for the real build) — empty until first sbatch run.
+- `experiments/droid_action_cond/outputs/v2v_dataset_single/` — 1-chunk reference dataset, fully VAE-encoded for inspection.
+- `experiments/droid_action_cond/outputs/v2v_dataset_clvr/` — full CLVR-episode (6-chunk) dataset, with the warm-cache timing measurement.
+
+### DROID scale framing (what's actually addressable)
+
+The HF mirror at `/storage/project/r-agarg35-0/lwang831/droid_hf/` has the **full** DROID — 92,233 episodes, 27M frames, ~500 hours. DROID-100 is the curated quality subset. For our method the real-world constraint is per-episode VGGT wrist calibration (~30 s GPU each), not raw data availability:
+
+| Tier | Episodes | Chunks | Calibration cost |
+|---|---|---|---|
+| Today | 5 | 40 | done |
+| DROID-100 full | 100 | ~800 | ~1 hr more VGGT |
+| 10% of DROID | ~9k | ~80k | ~75 hr single-GPU, ~10 hr on 8 GPUs |
+| All DROID | ~92k | ~750k | ~30 days single-GPU, ~4 days on 8 GPUs |
+
+PRoPE is depth-free — only warp-latent needs depth, and depth comes free as a byproduct of VGGT (the model returns per-image depth maps alongside the cameras; we currently throw them away in `calibrate_wrist_vggt_v2.py`). Capturing depth needs ~10 LoC of new save-output code, not a new model.
+
+### What's left (NOT done in this entry)
+
+- **DROID-HF parquet → per-episode `data.npz`** — `chunk_context.py` currently works on already-extracted episodes. Extending coverage to fresh DROID episodes needs the extract step. Existing helpers in `packages/ltx-action-cond/src/ltx_action_cond/droid.py` work against TF/RLDS, not the LeRobot parquet format on disk.
+- **Cameras + depth dumps** for PRoPE/warp-latent (items #6, #8–10 from the punch list).
+- **Caption dedup** to cut conditions/ disk by 85%.
+- **Strategy-side wiring** to read `batch["cameras"]` and `batch["depths"]` once they exist.
+
+### Wiring state after this entry
+
+- `experiments/droid_action_cond/build_v2v_dataset.py` — new, one-shot builder used for smoke verification.
+- `experiments/droid_action_cond/build_dataset_resumable.py` — new, production orchestrator.
+- `experiments/droid_action_cond/build_dataset_resumable.sbatch` — new, Slurm wrapper.
+- `experiments/droid_action_cond/monitor_dataset_build.sh` — new, watchdog.
+
+---
+
+## 2026-05-19 — PRoPE + Warp Latent + Action-Cond wired through the trainer
+
+Three opt-in conditioning paths landed on the trainer side, all verified loading the stock LTX-2.3 22B distilled checkpoint on an L40S. The kernels for two of these (PRoPE attention, raw-action MLP projector) had been sitting in `ltx-core` from earlier commits — wiring them into `ltx-trainer` was the missing piece. The third (MosaicMem-style warp-latent) is new code.
+
+### What landed
+
+| Feature | Flag (`acceleration.*`) | New params | Verified on L40S |
+|---|---|---|---|
+| **PRoPE** — Cameras as Relative Positional Encoding | `use_prope: true` + `prope_patches_x/y` + `prope_image_width/height` | **0** (pure geometry; checkpoint loads byte-identical) | ✅ 48 blocks swapped, 28.60 GB peak, 0.83 s/step |
+| **Warp Latent** — MosaicMem Eq. 2 cross-view feature alignment | `use_warp_latent: true` | 0 | ✅ 28.59 GB peak, 0.83 s/step |
+| **Action-Cond** — `ActionMLPProjector` + token concat | `use_action_cond: true` + `action_dim: 8` | **4,512** (8 → 128 MLP, trains from scratch in the LoRA fine-tune) | ✅ 28.60 GB peak, 0.84 s/step |
+| **All three + IC-LoRA simultaneously** | all `true` | 4,512 | ✅ Loss=0.1519 after 2 steps, LoRA saves clean |
+
+Baseline (no flags) for comparison: 28.59 GB peak, 0.83 s/step, Loss=0.1495. All flags-on adds the projector params and shifts step time by ~1%.
+
+### Architecture choices worth recording
+
+**Post-hoc PRoPE enablement** (`ltx_core/model/transformer/enable_prope.py`) — instead of threading `use_prope` through `SingleGPUModelBuilder` → `LTXModelConfigurator` → `LTXModel.__init__` → `_init_transformer_blocks` (5 layers of config plumbing), we let the stock model load first, then walk `model.transformer_blocks` and swap each `attn1` for a PRoPE-enabled `Attention` carrying byte-identical weights. PRoPE adds zero learnable params, so `new.load_state_dict(old.state_dict(), strict=False)` is exact for every key except the PRoPE module's internal precomputed RoPE buffers (filtered with `strict=False`). This keeps the configurator stack untouched.
+
+**Action projector lives outside the transformer** — `ActionMLPProjector(action_dim → 128)` is a separate `nn.Module` on the trainer, not a submodule of the transformer. Its params are added to `_trainable_params` explicitly. The projector outputs `patchify_proj.in_features` (== 128, the VAE channel count), **not** `inner_dim` (4096): the action tokens get concat'd onto the pre-`patchify_proj` sequence so they ride the same lift-to-hidden-dim path as the video latents. First combined-smoke pass failed with `Expected size 128 but got size 4096` — that was the lesson.
+
+**Modality + TransformerArgs got two new optional fields**: `viewmats: (B, C, 4, 4)` and `Ks: (B, C, 3, 3)`. Both default `None`; `TransformerArgsPreprocessor.prepare()` propagates them; the video `attn1` call now passes them through. When `viewmats is None` the `Attention` layer's existing guard auto-falls back to vanilla RoPE, so `use_prope=True` is safe to set even before the dataloader carries cameras.
+
+**Warp-latent** (`ltx_core/conditioning/warp_latent.py`) implements MosaicMem Eq. 2 — per-pixel `(u', v') = Π(K_tgt T_tgt T_src⁻¹ K_src⁻¹ (u, v, D))`, then `F.grid_sample(mode='bilinear')`. Differentiable, no learnable params. Identity cameras + flat depth produce the identity transform (smoke-verified). One bf16 quirk: `torch.linalg.inv` doesn't support bf16, so the geometry runs in fp32 and only the sampling grid is cast back to the source dtype before `grid_sample`.
+
+### Scope honesty
+
+All three features are **wired** but the smoke runs them in their *degenerate* mode:
+
+- PRoPE: `viewmats=None` → auto-fallback to vanilla path.
+- Warp: identity `(K, T)` + flat depth → identity output.
+- Action-cond: actions are read and projected, but they're just (cmd_joints, cmd_gripper) from `data.npz` with no validation of whether the model actually learns from them in 2 steps.
+
+The verification proves: (a) the stock 22B checkpoint loads cleanly with all flags on, (b) all four code paths execute without shape mismatches or NaN, (c) LoRA fine-tune saves and resumes. It does **not** prove the features improve generation. That needs (i) real per-tile cameras for PRoPE, (ii) Depth Anything V3 maps for warp-latent, and (iii) longer training runs with held-out evaluation.
+
+### What's left to make each feature actually compute
+
+| Feature | What it needs from preprocessing |
+|---|---|
+| PRoPE | `cameras/<id>.pt = {viewmats: (4, 4, 4), Ks: (4, 3, 3)}` per chunk — directly derivable from `data.npz`'s `K1, K2, K_wrist, cam2base_1, cam2base_2, T_cam_to_hand` plus FK at chunk-t=0 |
+| Warp Latent | `depths/<id>.pt = {wrist_t0, ext1_t0, ext2_t0: (288, 512)}` per chunk — needs a DAv3 pass at chunk anchor frames (~0.2 s/chunk on L40S) |
+| Action-Cond | `actions/<id>.pt = {latents: (33, 8)}` per chunk — trivial dump from `data.npz` (already prototyped for the smoke chunks) |
+
+Trainer-side glue once those land: extend `VideoToVideoStrategy.get_data_sources()` to include `"cameras"` and `"depths"`, then in `prepare_training_inputs` replace the `batch.get("viewmats")` / identity-depth placeholders with `batch["cameras"]` and `batch["depths"]`. No further model-internals changes.
+
+### Wiring state after this entry
+
+- `packages/ltx-core/src/ltx_core/model/transformer/modality.py` — `Modality` gained `viewmats`, `Ks` fields.
+- `packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py` — `TransformerArgs` mirrors them; `TransformerArgsPreprocessor.prepare()` propagates.
+- `packages/ltx-core/src/ltx_core/model/transformer/transformer.py` — `attn1(...)` call passes `viewmats=video.viewmats, Ks=video.Ks`.
+- `packages/ltx-core/src/ltx_core/model/transformer/enable_prope.py` — **new**. Post-hoc PRoPE swap helper.
+- `packages/ltx-core/src/ltx_core/conditioning/warp_latent.py` — **new**. MosaicMem Eq. 2 implementation.
+- `packages/ltx-trainer/src/ltx_trainer/config.py` — `AccelerationConfig` gained `use_prope`, `prope_patches_x/y`, `prope_image_width/height`, `use_warp_latent`, `use_action_cond`, `action_dim`.
+- `packages/ltx-trainer/src/ltx_trainer/trainer.py` — owns the `ActionMLPProjector`, calls `enable_prope_on_model` after the dtype cast and before quantization, adds projector params to `_trainable_params`, prepares the projector under accelerate.
+- `packages/ltx-trainer/src/ltx_trainer/training_strategies/video_to_video.py` — adds `"actions"` to `get_data_sources()` when action-cond is on; in `prepare_training_inputs` reads `batch["actions"]`, resamples to `F_latent`, projects, and concats onto `combined_latents` with clean timesteps + sentinel spatial positions + zero loss-mask. Warp-latent path branches on `use_warp_latent` and runs on the ref latents. PRoPE viewmats/Ks read from `batch` (None for now). `compute_loss` slices the target window by `inputs.video_targets.shape[1]` so action tokens don't break MSE shape.
+
+---
+
+## 2026-05-18 — Robotiq 2F-85 gripper + gripper-aware wrist context
+
+Two related rendering fixes after side-by-side eyeballing on the chunked outputs. The first replaced the wrong end-effector model; the second fixed a wrist-context bug that treated the gripper as a world-frame object.
+
+### Robotiq 2F-85 swap
+
+DROID does not use the standard Franka Hand on most episodes — the bulk of the dataset uses a **Robotiq 2F-85** parallel-jaw mounted on the Franka flange via an adapter plate. DROID's only mount spec is `T_hand = identity` at the flange with CoM `[0, 0, 0.057]`; the flange-to-2F-85-base offset isn't published, so we set it manually.
+
+- New `packages/ltx-action-cond/src/ltx_action_cond/robotiq_kinematics.py`: hardcoded URDF tree from [a-price/robotiq_arg85_description](https://github.com/a-price/robotiq_arg85_description). 9 links, 6 unique STL meshes (knuckle/finger pairs share meshes). Drive joint `finger_joint ∈ [0, 0.725 rad]`; mimic relationships encoded in the joint table (axis sign + multiplier). `robotiq_link_T(theta)` returns per-link 4×4 transforms in the Robotiq base frame.
+- `FrankaMeshRenderer` gained `gripper: Literal["franka_hand", "robotiq_2f85"]` plus `robotiq_mount_yaw` and `robotiq_mount_z_offset`. Default yaw is `1.5π` — the value that matched GT after a brief two-iteration calibration loop on CLVR ext1/ext2. Default color is `(0.01, 0.01, 0.01)` per the URDF spec (real Robotiq is black plastic).
+- DROID's `gripper_position` is normalized `[0=open, 1=closed]`; mapped via `gripper_position_to_theta(g) = g · 0.725`.
+
+Coverage: the same mount and color work across all 5 chunked episodes (IPRL, CLVR, AUTOLab×2, TRI). No per-episode tuning.
+
+### Wrist context: the gripper was being treated as a world-frame object
+
+After the gripper swap, the wrist-camera context exposed a separate bug. The old pipeline took the raw GT `wrist0_img` — which *contains the gripper* sitting in the lower-middle of the frame — and warped the whole thing via a plane homography to the per-frame wrist pose. The gripper pixels got dragged across the image like table texture: the gripper visually "floats" in world coordinates instead of staying glued to the camera.
+
+The physical fact this missed: the wrist camera and the gripper share a **rigid frame**. When the fingers aren't moving, the gripper's pixel-space appearance is *literally invariant* — only finger open/close ever changes it.
+
+New pipeline, opt-in via `WRIST_CONTEXT_MODE=gripper_aware` (now the default; `simple` falls back to the legacy single-warp path):
+
+1. **Once per chunk** — render a gripper-only mesh at the chunk-t=0 wrist camera pose → gripper mask. TELEA-inpaint the gripper out of `wrist0_img` → `clean_bg_wrist0` (gripper-free scene plate).
+2. **Per frame** — warp `clean_bg_wrist0` via plane homography to frame `t`'s wrist pose (no gripper present, so nothing smears). Then:
+   - **`|Δgripper| < 0.03`** (common case — DROID chunks hold `cmd_g ≈ 1.00` or `0.00` for many consecutive frames): paste the real `wrist0_img` gripper pixels back at the same pixel location using `mask_0`. Zero render cost, perfect photorealism.
+   - **else**: render the Robotiq mesh at the per-frame wrist pose with the current `cmd_gripper[t]` and composite over the plate.
+
+A new `gripper_only=True` flag on `FrankaMeshRenderer.render()` skips the arm links — they're mostly out of the wrist FOV and would look wrong against the homography-warped plate.
+
+The legacy single-warp path is kept (not deleted) per user instruction — both modes are accessible.
+
+### Cost budget
+
+- Per chunk: one extra wrist render at t=0 + one TELEA inpaint. Amortised over 33 frames, negligible.
+- Per frame: an `np.where` for the common branch, or one extra mesh render for the rare finger-motion branch.
+- Total render count for a typical chunk goes from 66 (2 ext renders × 33 frames) to ~67–70.
+
+### EGL detour worth remembering
+
+Mid-iteration on PACE the renderer started failing with `GL_OUT_OF_MEMORY` on the first `glBufferData` — GPU empty (0 MiB used, 81 GB free), but every one of the 10 EGL devices enumerated by `pyrender.platforms.egl.query_devices()` failed identically. Cause: Slurm allocated GPU index 6 (`SLURM_STEP_GPUS=6`), cgroup-restricting access to one specific `/dev/dri/renderDN`. CUDA honors the visibility mask; pyrender's `eglGetDisplay(EGL_DEFAULT_DISPLAY)` does not — it enumerates all host DRI nodes and picks one we can't allocate against. Error 1285 is what NVIDIA's EGL driver returns in that case, *not* actual memory exhaustion.
+
+Tried `EGL_DEVICE_ID`, explicit vendor pinning, and sweeping every EGL device in the pyrender backend — all failed. The fix was to get a different node. Resubmitted to an L40S, EGL came up clean, render finished in minutes.
+
+Lesson: on multi-GPU HPC nodes, EGL `GL_OUT_OF_MEMORY` with empty VRAM is almost always a Slurm-cgroup / EGL-default-display mismatch, not a real allocation failure. Re-allocate before debugging deeper.
+
+### Outputs
+
+- `experiments/droid_action_cond/outputs/context_chunks/` — 40 chunks (5 episodes), Robotiq + legacy wrist mode.
+- `experiments/droid_action_cond/outputs/context_chunks_wrist_new/` — 16 chunks (IPRL + CLVR + TRI), Robotiq + new gripper-aware wrist mode. `TRI+52ca9b6a/chunk_06` is the best stress test — `cmd_g` transitions 1.00→0.00 so both branches fire.
+
+### Wiring state after this entry
+
+- `packages/ltx-action-cond/src/ltx_action_cond/robotiq_kinematics.py` — new module.
+- `packages/ltx-action-cond/src/ltx_action_cond/mesh_rendering.py:render()` — `gripper_only` flag added; `gripper` / `robotiq_mount_*` ctor args.
+- `experiments/droid_action_cond/chunk_context.py` — `WRIST_CONTEXT_MODE` env (`gripper_aware` default, `simple` for legacy).
+
+---
+
 ## 2026-05-15 — Server transfer: pre-staged assets and environment
 
 Moving from the local laptop (RTX 5090, 32 GB) to the training server. Everything needed for inference + fine-tuning is already on-server outside the `LTX-2/` workspace, so wiping/re-cloning the workspace doesn't touch the heavy stuff.

@@ -21,6 +21,8 @@ Two-pass to avoid TF + pyrender EGL conflict.
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 import random
@@ -33,13 +35,13 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-CALIB_DIR = Path("/home/licho/data/droid/calibration")
-DROID100 = Path("/home/licho/data/droid/droid_100/1.0.0")
+CALIB_DIR = Path(os.environ.get("DROID_CALIB_DIR", "/storage/project/r-agarg35-0/lwang831/droid/calibration"))
+DROID100 = Path(os.environ.get("DROID_RLDS_DIR", "/storage/project/r-agarg35-0/lwang831/droid/droid_100/1.0.0"))
 ROOT = Path(__file__).parent / "outputs" / "context"
 ROOT.mkdir(parents=True, exist_ok=True)
 
-N_EPISODES = 5
-RANDOM_SEED = 42
+N_EPISODES = int(os.environ.get("WRIST_DEMO_N", 3))
+RANDOM_SEED = int(os.environ.get("WRIST_DEMO_SEED", 42))
 PLANE_Z_DEFAULT = 0.0  # table height in base frame (Franka standard: base mount at z=0)
 
 
@@ -91,6 +93,17 @@ def pick_episodes(builder, calib) -> list:
         if not all(s in intr and intr[s].get("width", 0) > 0 for s in (ext1, ext2, wrist)):
             continue
         good.append(c)
+    # If WRIST_DEMO_EPS is set (comma-separated episode IDs), pick those in order.
+    # Otherwise fall back to seeded random sampling.
+    wanted = os.environ.get("WRIST_DEMO_EPS", "").strip()
+    if wanted:
+        wanted_ids = [e.strip() for e in wanted.split(",") if e.strip()]
+        by_id = {c.episode_id: c for c in good}
+        out = [by_id[eid] for eid in wanted_ids if eid in by_id]
+        missing = [eid for eid in wanted_ids if eid not in by_id]
+        if missing:
+            print(f"WARNING: requested episodes not in wrist-capable set: {missing}")
+        return out[:N_EPISODES]
     rng = random.Random(RANDOM_SEED)
     rng.shuffle(good)
     return good[:N_EPISODES]

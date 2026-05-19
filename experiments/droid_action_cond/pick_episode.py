@@ -9,6 +9,8 @@ Writes (under outputs/):
 
 from __future__ import annotations
 
+import os
+
 import json
 from pathlib import Path
 
@@ -24,8 +26,8 @@ from ltx_action_cond.droid import (
     serial_to_rls_image_key,
 )
 
-CALIB_DIR = Path("/home/licho/data/droid/calibration")
-DROID100 = Path("/home/licho/data/droid/droid_100/1.0.0")
+CALIB_DIR = Path(os.environ.get("DROID_CALIB_DIR", "/storage/project/r-agarg35-0/lwang831/droid/calibration"))
+DROID100 = Path(os.environ.get("DROID_RLDS_DIR", "/storage/project/r-agarg35-0/lwang831/droid/droid_100/1.0.0"))
 OUT = Path(__file__).parent / "outputs"
 GT_DIR = OUT / "01_gt"
 

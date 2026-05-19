@@ -229,6 +229,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     mask=video.self_attention_mask,
                     perturbation_mask=v_mask,
                     all_perturbed=all_perturbed,
+                    viewmats=video.viewmats,
+                    Ks=video.Ks,
                 )
                 * vgate_msa
             )

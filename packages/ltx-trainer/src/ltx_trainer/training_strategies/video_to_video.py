@@ -63,12 +63,20 @@ class VideoToVideoStrategy(TrainingStrategy):
         self.reference_downscale_factor = None  # Will be inferred from first batch
 
     def get_data_sources(self) -> dict[str, str]:
-        """IC-LoRA training requires latents, conditions, and reference latents."""
-        return {
+        """IC-LoRA training requires latents, conditions, and reference latents.
+
+        When acceleration.use_action_cond is enabled, also pull an ``actions/<id>.pt``
+        file per sample. Each file holds a tensor of shape (F_pixel, action_dim).
+        """
+        sources = {
             "latents": "latents",
             "conditions": "conditions",
             self.config.reference_latents_dir: "ref_latents",
         }
+        accel = getattr(self, "_acceleration_config", None)
+        if accel is not None and getattr(accel, "use_action_cond", False):
+            sources["actions"] = "actions"
+        return sources
 
     def prepare_training_inputs(  # noqa: PLR0915
         self,
@@ -109,6 +117,23 @@ class VideoToVideoStrategy(TrainingStrategy):
                 f"First batch had factor={self.reference_downscale_factor}, "
                 f"but current batch has factor={reference_downscale_factor}. "
                 f"All training samples must use the same reference/target resolution ratio."
+            )
+
+        # Optional MosaicMem-style warp-latent on the reference latents.
+        # `_acceleration_config` is attached by the trainer after strategy construction.
+        # With identity cameras + flat depth the warp is the identity transform — used
+        # for end-to-end wiring verification before real cameras/depth are plumbed in.
+        accel = getattr(self, "_acceleration_config", None)
+        if accel is not None and getattr(accel, "use_warp_latent", False):
+            from ltx_core.conditioning.warp_latent import warp_latent
+
+            b, _, _, hL, wL = ref_latents.shape
+            dev, dt = ref_latents.device, ref_latents.dtype
+            eye_K = torch.eye(3, device=dev, dtype=dt).unsqueeze(0).expand(b, 3, 3).contiguous()
+            eye_T = torch.eye(4, device=dev, dtype=dt).unsqueeze(0).expand(b, 4, 4).contiguous()
+            flat_depth = torch.ones(b, hL, wL, device=dev, dtype=dt)
+            ref_latents = warp_latent(
+                ref_latents, src_K=eye_K, src_T=eye_T, tgt_K=eye_K, tgt_T=eye_T, depth=flat_depth
             )
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
@@ -206,6 +231,55 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Concatenate positions along sequence dimension
         positions = torch.cat([ref_positions, target_positions], dim=2)
 
+        # Action-cond Stream 2: project the per-frame action vector and append the
+        # resulting tokens onto combined_latents (MosaicMem-style concat). The projector
+        # is owned by the trainer and attached to the strategy at init time.
+        action_seq_len = 0
+        if accel is not None and getattr(accel, "use_action_cond", False) and getattr(self, "_action_projector", None) is not None:
+            actions_raw = batch["actions"]["latents"] if isinstance(batch["actions"], dict) else batch["actions"]
+            actions_raw = actions_raw.to(device=device, dtype=dtype)
+            if actions_raw.dim() != 3:
+                raise ValueError(f"actions must be (B, F_pixel, action_dim), got {tuple(actions_raw.shape)}")
+            # Resample from pixel-frame rate to latent-frame rate (one token per latent frame).
+            # LTX's temporal compression is 8x with the (F % 8 == 1) frame constraint,
+            # so F_latent = (F_pixel - 1) // 8 + 1.  Use uniform-stride decimation: indices
+            # [0, scale, 2*scale, ...].
+            f_pixel = actions_raw.shape[1]
+            f_latent = num_frames  # 'num_frames' here is already the latent count
+            # Map latent frame index -> source pixel index, evenly distributed across the clip.
+            if f_pixel >= f_latent:
+                src_idx = torch.linspace(0, f_pixel - 1, steps=f_latent, device=device).round().long()
+                actions_resampled = actions_raw[:, src_idx, :]
+            else:
+                # Source already shorter than latent — repeat last sample
+                actions_resampled = torch.nn.functional.interpolate(
+                    actions_raw.transpose(1, 2), size=f_latent, mode="nearest"
+                ).transpose(1, 2)
+            action_tokens = self._action_projector(actions_resampled)  # (B, F_latent, hidden_dim)
+            action_seq_len = action_tokens.shape[1]
+            # Append onto the sequence.
+            combined_latents = torch.cat([combined_latents, action_tokens], dim=1)
+            # Per-token timesteps: clean (0) for action tokens.
+            action_timesteps = torch.zeros(batch_size, action_seq_len, device=device, dtype=timesteps.dtype)
+            timesteps = torch.cat([timesteps, action_timesteps], dim=1)
+            # Positions: time = latent-frame index (in seconds-ish units, but the model
+            # uses these as RoPE keys not physical time); spatial = a fixed negative sentinel
+            # to stay positionally out-of-band vs real video patches (see action_cond.py).
+            t_idx = torch.arange(action_seq_len, device=device, dtype=positions.dtype)
+            action_time_pos = torch.stack([t_idx, t_idx + 1.0], dim=-1)
+            sentinel_pos = torch.full((action_seq_len, 2), fill_value=-1.0, device=device, dtype=positions.dtype)
+            action_positions = torch.stack([action_time_pos, sentinel_pos, sentinel_pos], dim=0)
+            action_positions = action_positions.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+            positions = torch.cat([positions, action_positions], dim=2)
+
+        # PRoPE viewmats/Ks: leave None for the verification path. The Attention layer
+        # auto-falls back to vanilla RoPE when viewmats is None, so use_prope=True does
+        # NOT change the forward numerics here. When the preprocessed dataset is extended
+        # to carry per-tile (K, T), populate `batch["viewmats"]` / `batch["Ks"]` upstream
+        # and pass them through as (B, C, 4, 4) / (B, C, 3, 3) tensors below.
+        prope_viewmats = batch.get("viewmats") if isinstance(batch, dict) else None
+        prope_Ks = batch.get("Ks") if isinstance(batch, dict) else None
+
         # Create video Modality
         video_modality = Modality(
             enabled=True,
@@ -215,14 +289,18 @@ class VideoToVideoStrategy(TrainingStrategy):
             positions=positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            viewmats=prope_viewmats,
+            Ks=prope_Ks,
         )
 
         # Loss mask: only compute loss on non-conditioning target tokens
         # Reference tokens: all False (no loss)
         # Target tokens: True where not conditioning
+        # Action tokens: all False (clean conditioning, never penalised)
         ref_loss_mask = torch.zeros(batch_size, ref_seq_len, dtype=torch.bool, device=device)
         target_loss_mask = ~target_conditioning_mask
-        video_loss_mask = torch.cat([ref_loss_mask, target_loss_mask], dim=1)
+        action_loss_mask = torch.zeros(batch_size, action_seq_len, dtype=torch.bool, device=device)
+        video_loss_mask = torch.cat([ref_loss_mask, target_loss_mask, action_loss_mask], dim=1)
 
         return ModelInputs(
             video=video_modality,
@@ -241,12 +319,15 @@ class VideoToVideoStrategy(TrainingStrategy):
         inputs: ModelInputs,
     ) -> Tensor:
         """Compute masked loss only on target portion. Returns [B,]."""
-        # Extract target portion of prediction
+        # Extract target portion of prediction. Slice by the target tensor's seq_len
+        # so any tokens appended *after* the target (e.g. action-cond tokens) are
+        # excluded from the loss without breaking on a shape mismatch.
         ref_seq_len = inputs.ref_seq_len
-        target_pred = video_pred[:, ref_seq_len:, :]
+        target_seq_len = inputs.video_targets.shape[1]
+        target_pred = video_pred[:, ref_seq_len:ref_seq_len + target_seq_len, :]
 
-        # Get target portion of loss mask
-        target_loss_mask = inputs.video_loss_mask[:, ref_seq_len:]
+        # Get target portion of loss mask (same slice)
+        target_loss_mask = inputs.video_loss_mask[:, ref_seq_len:ref_seq_len + target_seq_len]
 
         # Compute per-element loss [B,]
         loss = (target_pred - inputs.video_targets).pow(2)

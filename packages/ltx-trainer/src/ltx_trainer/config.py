@@ -177,6 +177,48 @@ class AccelerationConfig(ConfigBaseModel):
         "for FSDP (sharded state). Disabled by default.",
     )
 
+    use_prope: bool = Field(
+        default=False,
+        description="Enable PRoPE (Cameras as Relative Positional Encoding) for the video "
+        "self-attention layers. Adds geometry-aware cross-tile attention with zero learnable "
+        "params. Requires the dataloader to provide per-sample viewmats (B, C, 4, 4) and Ks "
+        "(B, C, 3, 3); when absent the attention layer auto-falls back to the vanilla path.",
+    )
+    prope_patches_x: int | None = Field(
+        default=None, description="Per-tile patch grid width. Required when use_prope=True."
+    )
+    prope_patches_y: int | None = Field(
+        default=None, description="Per-tile patch grid height. Required when use_prope=True."
+    )
+    prope_image_width: int | None = Field(
+        default=None, description="Per-tile pixel width (used to normalise K). Required when use_prope=True."
+    )
+    prope_image_height: int | None = Field(
+        default=None, description="Per-tile pixel height. Required when use_prope=True."
+    )
+
+    use_warp_latent: bool = Field(
+        default=False,
+        description="Enable MosaicMem-style warped-latent conditioning. Reprojects the IC-LoRA "
+        "reference latents from a source camera to the target camera using per-pixel depth, then "
+        "feeds the warped features as the conditioning input. Verification path uses identity "
+        "cameras + flat depth (the warp is an identity transform). Requires depth + cameras in "
+        "the dataloader to do real work.",
+    )
+
+    use_action_cond: bool = Field(
+        default=False,
+        description="Enable raw-action token conditioning (Stream 2 in the GVT README). A small "
+        "ActionMLPProjector lifts the per-frame action vector (default 8-D: 7 Franka joints + 1 "
+        "gripper) into transformer hidden tokens; those tokens are appended to the latent "
+        "sequence MosaicMem-style. The projector trains from scratch as part of the LoRA fine-tune.",
+    )
+    action_dim: int = Field(
+        default=8,
+        description="Per-frame action vector dimension. Default 8 = 7 joints + 1 gripper.",
+        gt=0,
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
