@@ -6,6 +6,237 @@ Entries are in reverse chronological order.
 
 ---
 
+## 2026-07-08 — Active learning result: object-single AL is a null, and why (pivot to decision-aware WM)
+
+The object-centric single-scene active-learning experiment came back **negative-to-null**, and the diagnosis reframes the whole direction. Recording the result, the evidence, and the literature-backed conclusion so we don't re-run this configuration.
+
+### The experiment
+
+Two arms resumed from the step-30000 PRoPE checkpoint and trained 30000→50000 on one scene (`LIVING_ROOM_SCENE1`, "pick the tomato sauce and put it in the basket"). Each round proposes 30 candidate chunks (mix reach:10 / perturb:14 / random:6) and keeps `SELECT_K=8`:
+- **strategic** (`act_obj`) — the 8 highest teacher-forced latent-loss chunks (pure max-loss top-K, `AL_V2=0`, `SCORER=objbbox`).
+- **random** (`rand_obj`) — 8 uniformly.
+
+Both reached the matched 50000-step target (strategic `COMPLETED`; random ran to 49500+ under repeated embers preemption + `--requeue`).
+
+### Result — strategic does NOT beat random
+
+Head-to-head held-out eval (`eval_arms_local.py`, step-46250 matched pair, held-out perturb+random chunks, PSNR/SSIM on pred-vs-GT rollouts):
+
+| Metric | strategic | random | Δ (strat−rand) | significance |
+|---|---:|---:|---:|---|
+| PSNR (all) | 24.23 | 24.60 | **−0.37 dB** | t=−2.46, p≈0.017, random won 37/64 chunks |
+| SSIM (all) | 0.900 | 0.899 | +0.001 | t=+0.95 (tied) |
+
+Strategic is *slightly worse* on the one quality metric that was the point of the experiment. A statistical wash, tilting to random.
+
+### Why — three stacked confounds (all evidenced)
+
+1. **Pool saturation.** Only ~30 distinct episode identities in the scene; both arms had added essentially all of them by round ~3. After that the training diets are near-identical, so *selection has nothing left to act on.* The proof: the two arms' **training-loss curves are superimposable** (within ±0.002 at every 2000-step bin) and both **plateau at ~0.15 by step 44000**, flat-to-slightly-rising after. Same learning, same path — the wash is mechanical, not noise.
+2. **Undefined exploration support → wrong signal.** Pure max-loss top-K over `reach ∪ perturb ∪ random` preferentially grabs the *least-predictable* random-action rollouts. That inflates average MSE/PSNR (it over-invests in the hardest-to-render data) without improving structure (SSIM tied) — textbook greedy hard-example-mining pathology.
+3. **The ~0.15 floor is not aleatoric.** LIBERO sim is deterministic, so the loss floor is **partial-observability + VAE-reconstruction + LoRA capacity (misspecification)**, not environment noise. Data selection cannot lower a capacity/representation floor — which is exactly why both arms hit the same 0.15 regardless of diet. Not undertraining (converged/plateaued); if anything mildly over-trained on 30 identities.
+
+### Literature check (verified deep-research pass, 2026-07-08)
+
+A 107-agent, adversarially-verified review (25 sources, 23/25 claims confirmed; note `[[data_sampling_litreview]]`) confirms the failure was predictable and names the fixes:
+- **RHO-LOSS** (Mindermann et al., ICML 2022): greedy max-loss selects "noisy (not learnable) or less task-relevant" points; the fix is *reducible* loss = training loss − a holdout/reference model's loss, which subtracts the irreducible component. **Direct antidote to our max-loss run.**
+- **BatchBALD / core-set** (Kirsch NeurIPS 2019; Sener & Savarese ICLR 2018): naive top-K by any per-point score "acquires similar and redundant points, sometimes performing worse than random." Our `SELECT_K=8` top-K is that pathology. Fix = diverse batch (**BADGE**, Ash ICLR 2020 — tuning-free uncertainty×diversity).
+- **MacKay 1992 / value-equivalence** (Farahmand 2017, Grimm 2020): information/accuracy criteria are "the right answer to the wrong question" under misspecification; target a *region of interest* / decision-relevant error, not global accuracy.
+
+### The pivot (committed)
+
+Stop optimizing for a globally-accurate, general action-conditioned world model — it's the wrong objective *and* unreachable with a LoRA on one scene. Target a **decision-aware / value-aware world model** accurate on the **policy-relevant distribution**, for eventual model-based-RL co-training with the trained LIBERO FlowMatchingPolicy (0.80 BC success, lives in the separate `imitation` repo — see `[[fm_bc_policy_asset]]`). New AL signal, when it re-enters: **reducible-loss + diverse batch, aimed at the policy occupancy.** Phased eval plan (T1 single-step policy-action consistency → T2 action-divergence vs horizon → T3 closed-loop task success). Open problem the verified theory does not cover: active learning against a **non-stationary occupancy** that moves as the policy improves.
+
+Assets: `experiments/libero_sim/eval_arms_local.py` (the held-out arm comparison), `outputs/obj_single_arm_eval_step46250/arm_compare.{json,txt}` (the deliverable). Memory: `[[al_null_decision_aware_pivot]]`, `[[data_sampling_litreview]]`, `[[fm_bc_policy_asset]]`.
+
+---
+
+## 2026-06-14 — End-to-end timing: context build vs DiT vs decode (active-learning budget)
+
+Profiled the full LIBERO per-chunk / per-episode cost ahead of the active-learning loop, so we know where the wall-clock goes. Instrumentation is `GVT_TIME`-gated (no-op in production) in `infer_action_cond.py` and `build_libero_context.py`. Bench jobs: `bench_infer_time.sbatch` (9957781, inference split on the real eval code path, step 80000, PRoPE, 256×512×33, 30 steps), `bench_render_split.sbatch` / `bench_render_only.sbatch` (9957931 / 9957941, FK render split from a cached capture npz). All on gpu-h200.
+
+**Two regimes, and the key framing:** "context building" is *offline precompute*, not part of inference. The 22B model is never resident during context build; inference loads precomputed latents/conditions/cameras off disk and never touches the VAE encoder or Gemma. They were conflated before — keep them separate.
+
+**Full pipeline per chunk (and ×7 ≈ one T=200 episode):**
+
+| Phase | s/chunk | s/episode | Bottleneck |
+|---|---:|---:|---|
+| Context: sim rollout | ~0.9 | ~6 | — |
+| Context: **FK render** | ~14.7 | **~103** | `fuse_scene_cloud` |
+| Context: VAE-encode + Gemma | ~8.2 | ~57 | encode batch |
+| Inference: **DiT (30 steps)** | ~4.75 | ~33 | the model (158 ms/step) |
+| Inference: VAE decode (pred) | ~1.0 | ~7 | — |
+
+Inference deploy cost = DiT + 1 decode ≈ **5.75 s/chunk** (DiT ~83%); eval cost (3 decodes for pred|gt|ctx) ≈ 7.8 s/chunk; first chunk pays a one-time ~20 s CUDA/cuDNN warmup.
+
+**FK context render split** — capture pass (MuJoCo/robosuite, clean in-situ numbers):
+
+| Stage | Time |
+|---|---:|
+| env setup (scene compile + `reset_from_xml_string`) | 4.8 s |
+| per-frame loop: 200 fr × 3 cam × (RGB+depth+seg) | 21.5 s (36 ms/frame-cam) |
+| npz save (100 MB compressed) | 9.8 s |
+
+Render pass (pyrender) — **relative ordering is robust; absolutes ran ~3× hot** on a CPU-contended node (`fuse`/`save` are CPU-bound numpy), so trust the production episode total ~103 s, not these per-stage seconds:
+
+| Stage | rel. | Used in training? |
+|---|---:|---|
+| **`fuse_scene_cloud`** (rebuild 3-cam point cloud, per chunk) | **~75%** | yes (→ `wrist_context_fused`) |
+| `wrist_splat` | ~11% | yes |
+| `fixed_mesh` (2 fixed cams) | ~11% | only agentview kept |
+| `depth_reproject` (single-view) | small | **no — `wrist_context_single`, debug** |
+| `wrist_mesh` (gripper) | small | yes |
+| save (npz-compress + `headline.mp4`) | heavy | partly debug |
+
+Encoder reads only `agentview_frames`, `wrist_frames`, `agentview_context_robot`, `wrist_context_fused`, `joints`, `gripper` (verified in `encode_libero_precomputed.py`). Everything else rendered/saved is unused.
+
+**Active-learning implication:** per candidate episode ≈ **~200 s**, of which **~80% is context building** (render ~103 + encode ~57); the model is only ~40 s. Speed work belongs in the build, not inference. Priority levers: (1) **`fuse_scene_cloud`** — caches the static-scene cloud across chunks / subsample points; (2) pure wins — drop `depth_reproject`/`wrist_context_single`, stop writing `headline.mp4`+`clean_plate`, use uncompressed `np.savez`; (3) frontview is not a training view but its RGB-D feeds the wrist fused cloud, so dropping it is a speed↔wrist-fill tradeoff (A/B it); (4) raise VAE encode `--batch_size`; (5) shard candidates across GPUs (build is embarrassingly parallel).
+
+**Update (same day) — `fuse` bottleneck root-caused and fixed.** The "`fuse_scene_cloud` ~75%" number was misleading: the geometry is ~90 ms; the cost was **repeated zlib decompression**. `render()` read the intermediate with `np.load` (a lazy `NpzFile` that does *not* cache), so each `d[key][s]` re-inflated the full array — ~100× per episode of CPU-bound zlib, which ballooned under node contention (hence 10 s on a clean node, 84 s on a busy one). Two edits in `build_libero_context.py`: intermediate `np.savez_compressed`→`np.savez` (scratch, no point compressing), and `np.load(...)`→`dict(np.load(...))` to materialize once. Measured on a clean H200, render-only on a cached capture npz: **`fuse` 9.99 s → 0.09 s (~110×)**, render-compute 35.1 s → 26.2 s. Materializing exposed a **latent aliasing bug**: `_label()` (debug `headline.mp4`) did `np.ascontiguousarray(img)` — a no-op on an already-contiguous `gt[t]` view — then `cv2.putText` drew the label *in place*, corrupting the shared source frames; harmless under the old copy-per-access `NpzFile`, but it poisoned the one overlapping chunk (start 167 over 165) once arrays persisted. Fixed `_label` to copy (`np.array(img, dtype=np.uint8)`). After the fix, output is **bit-identical** to baseline across 139/140 arrays; the single residual diff is **1 pixel ±1** on the discarded `frontview`, proven to be EGL rasterization nondeterminism (two identical-code runs differ identically). `save` (compressed final per-chunk `data.npz`, ~19.7 s) is now the largest render-pass term and the next lever. Next bottleneck after `fuse` is now `wrist_splat`/`fixed_mesh` (~11–12 s each).
+
+**Safe-first production trim (`GVT_DEBUG`, default off).** Gated everything the downstream chain never reads behind `GVT_DEBUG=1`: `encode_libero_precomputed` reads only agentview+wrist `frames`/`context`, and `build_libero_cameras` only `VIEWS=("agentview","wrist")` `K`/`cam2world`. So in production we now (a) skip rendering+saving `frontview` entirely — it stays a *capture/fuse source* (read from `d` inside `fuse_scene_cloud`) but its robot-mesh render and arrays are dropped; (b) skip `depth_reproject`/`wrist_context_single` (comparison-only); (c) skip `*_clean_plate` save; (d) skip `headline.mp4`. Render-only A/B on the same cached capture npz, clean H200: `fixed_mesh` 11.74→**5.86 s** (frontview half gone), `depth_reproject` 1.61→**0 s**, `save` 19.61→**8.24 s** (no debug arrays + no mp4), render_compute_total 26.18→**19.01 s**; whole render pass **~46.5 s → ~28 s (~40% faster)**. Disk **13.3 MB → 7.0 MB per chunk** (~47%). Verified: the 13 downstream-consumed array types are **bit-for-bit identical** to baseline across all 7 chunks (91 instances); only debug keys dropped. `GVT_DEBUG=1` restores the full baseline key set + `headline.mp4`. `wrist_splat` (~11.8 s) is now the #1 render cost — the GPU splat path (`render_wrist_scene_splat_gpu`) is the next lever, then `save`.
+
+---
+
+## 2026-05-27 — LIBERO context data builder (sim-exact cameras, two priors)
+
+The DROID context pipeline synthesizes a geometric prior the hard way: VGGT to
+estimate the wrist mount, FK to propagate it, a Franka mesh render over an
+inpainted plate for the fixed views, and a plane-homography warp for the wrist.
+LIBERO is a *simulator*, so every per-frame camera pose (and depth) is exact —
+the entire calibration burden vanishes. New builder `experiments/libero_sim/
+build_libero_context.py` mirrors the DROID per-chunk structure (33-frame windows,
+overlap-tail, anchored to each chunk's own t0) for the 3 views agentview +
+frontview + robot0_eye_in_hand.
+
+**Two priors per chunk per view, for comparison** (chosen because sim uniquely
+gives both exact poses *and* exact depth):
+- `*_context_homography` — reuses the DROID `render_wrist_via_plane_homography`
+  kernel, fed sim's exact cam→world at t0 (source) and frame-t (target). Fixed
+  cams → near-static; wrist → warped moving prior. Plane anchored at the wrist
+  t0 depth median (LIBERO table z ≈ 0.900).
+- `*_context_depth` — forward 3D reprojection of the chunk-t0 frame using the
+  exact t0 depth buffer + exact cameras, z-buffered scatter (near wins).
+
+**What the comparison shows** (KITCHEN_SCENE1 demo_0, 189 frames → 6 chunks):
+depth-reproj is near-perfect on the fixed cams (coverage 0.96–0.99, MAE-vs-GT
+~3.6, i.e. only the moving arm differs) and geometrically correct on the wrist
+(coverage 0.76; holes are honest disocclusion as the camera sweeps). The plane
+homography is fine on the table plane but warps off-plane content (walls, tall
+objects) wrong/black — frontview MAE 26 vs depth's 3.7. Depth reprojection is
+clearly the better scaffold; homography is the cheap fallback.
+
+Cameras (per-frame cam→world + K per view) are saved alongside, so these chunks
+double as the `cameras/<id>.pt` source for PRoPE (order [agentview, frontview,
+wrist] = [ext1, ext2, wrist]). Output: `experiments/droid_action_cond/outputs/
+libero_context_chunks/<id>/chunk_NN/{data.npz, info.json, headline.mp4}`.
+headline.mp4 stacks GT | homography | depth across the 3 views.
+
+Prereq: the LIBERO render fix (robosuite EGL byref patch + author asset-path
+localizer) from the same day — without it the env can't render at all.
+
+---
+
+## 2026-05-27 — PRoPE fix: 3D RoPE ⊕ projective (not a RoPE replacement)
+
+The PRoPE port wired in on 2026-05-19 was wrong in a way that would have silently degraded training. It did 2D `(x, y)` spatial RoPE that **replaced** the model's native 3D RoPE — discarding the temporal axis entirely. PRoPE is supposed to *add* a camera-relative term, not overwrite position encoding. The PRoPE branch in `attention.py` never called `apply_rotary_emb` at all.
+
+### The correct construction
+
+Split each attention head's `head_dim=128` into two **disjoint** sub-spaces, run block-diagonally:
+
+- `[0 : d_rope)` → native 3D RoPE (time, height, width), **untouched**
+- `[d_rope : 128)` → per-token projective camera transform (PRoPE), `d_rope = head_dim - proj_dim`
+
+Disjoint is mandatory — mixing the projective block into the RoPE block corrupts both relative-pose identities. The projective block applies `Pᵀ` to Q, `P⁻¹` to K/V, `P` to the output, where `P = lift(K_norm) @ viewmat` (image←world); the attention logit becomes `qᵀ(P_a P_b⁻¹)k`, i.e. relative camera geometry. With `proj_dim = 0` (or identity cameras) the module is bit-identical to vanilla 3D RoPE.
+
+A subtlety drove the design: LTX's split-style RoPE pairs dim `i` with `i+64`, so slicing the *global* `pe=(cos,sin)` to a `d_rope` sub-block is messy. Resolved by having `PropeAttention` build its **own** `d_rope`-sized 3D RoPE directly from `positions` — self-contained, no global `pe` plumbing changes.
+
+### Per-token, not per-view
+
+PRoPE operates on `viewmats (B,T,4,4)` / `Ks (B,T,3,3)` — one camera per **token**. The dataloader expands the 3 physical views (ext1, ext2, wrist) to per-token cameras by tile membership: `_build_per_token_cameras()` maps each token to its quadrant via `positions` (TL=ext1, TR=ext2, BR=wrist, BL=blank) and scatters the matching camera. Blank-tile and action tokens get an identity camera (`P = I`, no-op).
+
+### Data flow now complete on both ends
+
+- **Model:** `positions` plumbed `TransformerArgs` → block → `Attention.forward` → `PropeAttention`. `Attention` constructor takes `prope_proj_dim` (replaces the old `prope_patches_x/y`), `prope_image_width/height`, `prope_max_pos`, `prope_theta`.
+- **Dataloader:** `get_data_sources()` adds a `cameras` source when `use_prope`; contract `cameras/<id>.pt = {viewmats: (V,4,4), Ks: (V,3,3)}`, order `[ext1, ext2, wrist]`, `Ks` in per-tile pixel resolution.
+
+### Verification (CPU property + integration tests, all passing)
+
+`packages/ltx-core/tests/`, `packages/ltx-trainer/tests/`:
+1. Identity cameras → exact partial 3D RoPE (err 0) — projective block is a true no-op when `P=I`.
+2. Temporal structure live — distinct per-token times change output (diff 1.3); uniform time shift cancels (relative encoding), proving 3D RoPE survives. (The first "temporal" test failed at diff 1e-12 because I shifted *all* tokens uniformly — that correctly cancels; not a kernel bug.)
+3. Gauge invariance — global world-frame change leaves logits unchanged (rel err 6e-8 no-K, 1.3e-7 with-K). Required switching to a *relative* error threshold + analytic `_invert_SE3`; the absolute error was pure float roundoff scaled by translation magnitude (confirmed by ~10× drop when shrinking translations 5×).
+4. Fallback — `use_prope=True` with no cameras == vanilla RoPE (err 0), so flipping the flag is safe before cameras flow.
+5. Per-token camera builder — quadrant→view mapping exact ({ext1:4, ext2:4, wrist:4, blank:4} on a 4×4 grid); action+blank → identity; missing `cameras` → `(None, None)`.
+
+### What's left
+
+Data generation: the dataset build (`chunk_context` / `build_dataset_resumable`) does not yet emit `cameras/<id>.pt`. Derivable from `K1, K2, K_wrist`, `cam2base_1/2`, `T_cam_to_hand` + per-frame FK. A per-frame wrist camera (vs. static at chunk-t=0) is a high-value refinement. Then a Q/K LoRA to absorb the positional-encoding shift.
+
+---
+
+## 2026-05-20 — Full-pipeline 4-rung ladder + universe enumeration
+
+The orchestrator from 2026-05-19 only knew how to do the *second half* (tile → process_dataset → atomic commit) over a hand-staged set of pre-rendered chunks. With ~16 chunks staged it looked like a 16-chunk universe; the watchdog was happily reporting "done." It wasn't doing the whole DROID set.
+
+Now the orchestrator runs the **full** pipeline per chunk:
+
+| Rung | Subprocess | Produces | Atomicity |
+|---|---|---|---|
+| A — extract | `wrist_demo.py --mode extract` (TF) | `outputs/context/<ep>/data.npz` + info.json | per-ep tmp dir → `_atomic_replace_dir` |
+| A' — augment | `chunk_context.py --mode augment` (TF) | adds `cmd_gripper_position` to data.npz | in-place; recovered next launch if interrupted |
+| B — VGGT calibrate | `calibrate_wrist_vggt.py` (Torch) | `outputs/wrist_calib_vggt/<ep>.json` | per-ep tmp JSON → `os.replace` |
+| C — chunk render | `chunk_context.py --mode render` (EGL+pyrender) | `outputs/context_chunks_wrist_new/<ep>/chunk_NN/` | per-chunk tmp dir → `_atomic_replace_dir` |
+| D — tile + encode | (as before) `process_dataset.py` → atomic commit on cedar | unchanged |
+
+Each rung is a *separate subprocess*: TF + EGL cannot share a process; VGGT wants its own torch ctx; the trainer hogs the GPU. That isolation is now structural rather than incidental.
+
+### Universe manifest (`_universe.json`)
+
+`enumerate_universe.py` is the new single source of truth for "what chunks exist." Reads droid_100 RLDS (currently the only on-disk DROID source), filters by IoU ≥ 0.85 calibration quality + wrist-capable cameras, splits each surviving episode into 33-frame windows (overlap-tail), and atomically writes the manifest to `out_root/_universe.json`. Watchdog reads `len(_universe.json)` every tick so adding more episodes (or lowering the IoU floor) doesn't require restarting the watchdog.
+
+Current scale: **71 chunks across 12 episodes** at IoU ≥ 0.85 (vs the 16 chunks / 3 episodes that the old hand-staged set was building).
+
+### New env-var hooks (so the orchestrator can stage each rung into a tmp dir)
+
+- `WRIST_EXTRACT_OUT` — redirects `wrist_demo.py`'s episode-level output root.
+- `VGGT_EPS_FILTER` — comma-separated short-id whitelist for `calibrate_wrist_vggt.py`.
+- (existing hooks `CHUNK_EPS` / `CHUNK_OUT_ROOT` from chunk_context.py reused for rungs A'+C.)
+
+### `_atomic_replace_dir` — directory-level rename that doesn't trash a good dir before the new one lands
+
+```python
+backup = dst.with_name(f".{dst.name}.bak.{pid}")
+os.replace(dst, backup)         # move existing aside (atomic)
+try:    os.replace(src, dst)    # swap in new (atomic)
+except: os.replace(backup, dst); raise   # rollback if rename fails
+shutil.rmtree(backup, ignore_errors=True)
+```
+
+Same-FS guarantee: every staging dir is colocated with its destination's parent.
+
+### Per-rung "is this already done?" predicates
+
+The orchestrator never re-runs work whose output is already on disk:
+
+- `_episode_extracted(ep_short)` — `data.npz` exists AND has both extract keys *and* the augment-pass-added `cmd_gripper_position`.
+- `_vggt_done(ep_short)` — calib JSON loads and has `T_cam_to_hand`.
+- `_chunk_rendered(ep_short, chunk_idx)` — chunk's `data.npz` has all 8 frame arrays + cmd_* + intrinsics.
+
+`ensure_upstream_for(pending)` runs A→A'→B→C and returns the subset of `pending` whose rung-C output now exists. Anything that failed gets retried next launch (probably on a different node).
+
+### Smoke test (single chunk, A100 40GB)
+
+`--only_cids AUTOLab_84bd5053_..._c00 --batch_size 1 --skip_upstream --load_text_encoder_in_8bit` → **229 s wall, 1/1 committed, no staging leftovers, all 4 .pt files load and have the expected shapes.** Initial run on a V100 16GB OOMed at LTX-2.3 load — V100 is fine for the calibration/render rungs but not for D. The sbatch's `gpu-v100,gpu-a100,gpu-h100` partition list lets slurm route the job onto a big-enough GPU.
+
+The `OSError: Device or resource busy` lines that show up at the end of each process_dataset stage are multiprocessing pool finalizers tearing down `pymp-*` tmp dirs on cedar after the stage already wrote its outputs successfully — noise, not failure.
+
+### Watchdog re-armed
+
+Tick 1 after the smoke: `Progress: 17/71 chunks done. [MISS] gvt_data not in queue — submitting one sbatch.` Submitted `8739748`. The full DROID-100/IoU-0.85 subset is now being built unattended.
+
+---
+
 ## 2026-05-19 — Dataset build pipeline: tiled v2v IC-LoRA + resumable orchestrator + Slurm watchdog
 
 End-to-end preprocessed dataset pipeline for the GVT trainer. Goal: take the per-chunk `data.npz` files we already render (`outputs/context_chunks_wrist_new/<ep>/chunk_NN/data.npz`), produce trainer-ready `latents/conditions/reference_latents/actions` on disk, and survive Slurm preemption arbitrarily many times without data corruption.
@@ -125,7 +356,7 @@ Three opt-in conditioning paths landed on the trainer side, all verified loading
 
 | Feature | Flag (`acceleration.*`) | New params | Verified on L40S |
 |---|---|---|---|
-| **PRoPE** — Cameras as Relative Positional Encoding | `use_prope: true` + `prope_patches_x/y` + `prope_image_width/height` | **0** (pure geometry; checkpoint loads byte-identical) | ✅ 48 blocks swapped, 28.60 GB peak, 0.83 s/step |
+| **PRoPE** — Cameras as Relative Positional Encoding | `use_prope: true` + `prope_patches_x/y` + `prope_image_width/height` *(superseded 2026-05-27 → `prope_proj_dim`; that port replaced 3D RoPE — see entry above)* | **0** (pure geometry; checkpoint loads byte-identical) | ✅ 48 blocks swapped, 28.60 GB peak, 0.83 s/step |
 | **Warp Latent** — MosaicMem Eq. 2 cross-view feature alignment | `use_warp_latent: true` | 0 | ✅ 28.59 GB peak, 0.83 s/step |
 | **Action-Cond** — `ActionMLPProjector` + token concat | `use_action_cond: true` + `action_dim: 8` | **4,512** (8 → 128 MLP, trains from scratch in the LoRA fine-tune) | ✅ 28.60 GB peak, 0.84 s/step |
 | **All three + IC-LoRA simultaneously** | all `true` | 4,512 | ✅ Loss=0.1519 after 2 steps, LoRA saves clean |
@@ -169,7 +400,7 @@ Trainer-side glue once those land: extend `VideoToVideoStrategy.get_data_sources
 - `packages/ltx-core/src/ltx_core/model/transformer/transformer.py` — `attn1(...)` call passes `viewmats=video.viewmats, Ks=video.Ks`.
 - `packages/ltx-core/src/ltx_core/model/transformer/enable_prope.py` — **new**. Post-hoc PRoPE swap helper.
 - `packages/ltx-core/src/ltx_core/conditioning/warp_latent.py` — **new**. MosaicMem Eq. 2 implementation.
-- `packages/ltx-trainer/src/ltx_trainer/config.py` — `AccelerationConfig` gained `use_prope`, `prope_patches_x/y`, `prope_image_width/height`, `use_warp_latent`, `use_action_cond`, `action_dim`.
+- `packages/ltx-trainer/src/ltx_trainer/config.py` — `AccelerationConfig` gained `use_prope`, `prope_patches_x/y` *(→ `prope_proj_dim`, 2026-05-27)*, `prope_image_width/height`, `use_warp_latent`, `use_action_cond`, `action_dim`.
 - `packages/ltx-trainer/src/ltx_trainer/trainer.py` — owns the `ActionMLPProjector`, calls `enable_prope_on_model` after the dtype cast and before quantization, adds projector params to `_trainable_params`, prepares the projector under accelerate.
 - `packages/ltx-trainer/src/ltx_trainer/training_strategies/video_to_video.py` — adds `"actions"` to `get_data_sources()` when action-cond is on; in `prepare_training_inputs` reads `batch["actions"]`, resamples to `F_latent`, projects, and concats onto `combined_latents` with clean timesteps + sentinel spatial positions + zero loss-mask. Warp-latent path branches on `use_warp_latent` and runs on the ref latents. PRoPE viewmats/Ks read from `batch` (None for now). `compute_loss` slices the target window by `inputs.video_targets.shape[1]` so action tokens don't break MSE shape.
 
