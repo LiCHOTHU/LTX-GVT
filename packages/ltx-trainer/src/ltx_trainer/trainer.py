@@ -379,11 +379,103 @@ class LtxvTrainer:
             perturbations=None,
         )
 
-        # Use strategy to compute loss
+        # Use strategy to compute loss (latent-space velocity MSE)
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+
+        # Perceptual Flow Matching (opt-in via PFM_ENABLE=1): supervise the recovered clean
+        # prediction in pixel/DINOv2 feature space instead of (or blended with) latent MSE.
+        if self._pfm_enabled():
+            self._ensure_pfm()
+            perc = self._perceptual_loss(video_pred, model_inputs)
+            loss = self._pfm["mse_weight"] * loss + self._pfm["weight"] * perc
+
         sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
         return TrainingStepOutput(loss=loss, sigma=sigma)
+
+    # ---------------------------------------------------------------- Perceptual Flow Matching
+    # Opt-in (PFM_ENABLE=1). Decodes the recovered clean latent x_hat0 to pixels through the
+    # frozen VAE decoder (in-graph) and matches it to the true clean frame in DINOv2 feature
+    # space (arXiv 2607.03524). Env knobs: PFM_WEIGHT (perceptual, default 1.0),
+    # PFM_MSE_WEIGHT (keep latent MSE, default 0.0 = pure replace), PFM_FRAMES (decode a
+    # subset of latent frames, default 0 = all). DINOv2 ViT-S/14 loads from the local hub cache.
+    _DINO_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    _DINO_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    @staticmethod
+    def _pfm_enabled() -> bool:
+        return os.environ.get("PFM_ENABLE", "0") == "1"
+
+    def _ensure_pfm(self) -> None:
+        """Lazy one-time setup: parse env knobs and load DINOv2 from the offline hub cache."""
+        if getattr(self, "_pfm", None) is not None:
+            return
+        self._pfm = {
+            "weight": float(os.environ.get("PFM_WEIGHT", "1.0")),
+            "mse_weight": float(os.environ.get("PFM_MSE_WEIGHT", "0.0")),
+            "frames": int(os.environ.get("PFM_FRAMES", "0")),
+        }
+        os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+        hub = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+        self._dino_dtype = torch.bfloat16
+        dino = torch.hub.load(hub, "dinov2_vits14", source="local", pretrained=True)
+        self._dino = dino.to(self._accelerator.device, self._dino_dtype).eval().requires_grad_(False)
+        logger.info(
+            f"PFM enabled: weight={self._pfm['weight']} mse_weight={self._pfm['mse_weight']} "
+            f"frames={self._pfm['frames'] or 'all'} (DINOv2 ViT-S/14)"
+        )
+
+    def _dino_feats(self, pix: Tensor) -> Tensor:
+        """[B,3,F,H,W] decoded video -> per-frame DINOv2 CLS features [B*F, D], kept in graph."""
+        x = ((pix.float() + 1.0) / 2.0).clamp(0, 1)  # map VAE output ~[-1,1] -> [0,1]
+        b, c, fr, h, w = x.shape
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * fr, c, h, w)
+        x = torch.nn.functional.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        x = (x - self._DINO_MEAN.to(x)) / self._DINO_STD.to(x)
+        return self._dino(x.to(self._dino_dtype))
+
+    def _perceptual_loss(self, video_pred: Tensor, model_inputs: Any) -> Tensor:
+        """Perceptual distance between decoded x_hat0 and decoded x0 (true clean). Scalar."""
+        from ltx_core.types import VideoLatentShape
+
+        mi = model_inputs
+        grid = mi.video_latent_grid
+        if grid is None or not mi.video.enabled:
+            return video_pred.new_zeros(())
+
+        ref = mi.ref_seq_len or 0
+        tgt = mi.video_targets.shape[1]
+        v_pred = video_pred[:, ref : ref + tgt, :]  # predicted velocity on target tokens
+        x_t = mi.video.latent[:, ref : ref + tgt, :]  # noisy (or clean, at cond tokens) target
+        v_true = mi.video_targets  # noise - x0
+        sigma = mi.video.sigma.view(-1, 1, 1).to(v_pred.dtype)
+
+        xhat0 = x_t - sigma * v_pred  # recovered clean prediction (Eq 4)
+        x0 = x_t - sigma * v_true  # true clean latent
+        # Conditioning tokens aren't predicted -> use the true clean latent there.
+        cond = ~mi.video_loss_mask[:, ref : ref + tgt]
+        xhat0 = torch.where(cond.unsqueeze(-1), x0, xhat0)
+
+        b = v_pred.shape[0]
+        f_l, h_l, w_l = grid
+        shape = VideoLatentShape(batch=b, channels=128, frames=f_l, height=h_l, width=w_l)
+        patchifier = self._training_strategy._video_patchifier  # noqa: SLF001
+        lat_hat = patchifier.unpatchify(xhat0, shape)
+        lat_gt = patchifier.unpatchify(x0, shape)
+
+        nfr = self._pfm["frames"]
+        if nfr and nfr < f_l:
+            lat_hat, lat_gt = lat_hat[:, :, :nfr], lat_gt[:, :, :nfr]
+
+        dec = self._vae_decoder
+        dt = next(dec.parameters()).dtype
+        pred_pix = dec(lat_hat.to(dt))  # in-graph decode of the prediction
+        with torch.no_grad():
+            gt_pix = dec(lat_gt.to(dt))  # fixed target
+        f_pred = self._dino_feats(pred_pix)
+        with torch.no_grad():
+            f_gt = self._dino_feats(gt_pix)
+        return (f_pred.float() - f_gt.float()).pow(2).mean()
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -518,13 +610,12 @@ class LtxvTrainer:
         if self._config.acceleration.use_prope:
             from ltx_core.model.transformer.enable_prope import enable_prope_on_model
 
-            for name in ("prope_patches_x", "prope_patches_y", "prope_image_width", "prope_image_height"):
+            for name in ("prope_proj_dim", "prope_image_width", "prope_image_height"):
                 if getattr(self._config.acceleration, name) is None:
                     raise ValueError(f"acceleration.{name} is required when use_prope=True")
             n_swapped = enable_prope_on_model(
                 self._transformer,
-                patches_x=self._config.acceleration.prope_patches_x,
-                patches_y=self._config.acceleration.prope_patches_y,
+                proj_dim=self._config.acceleration.prope_proj_dim,
                 image_width=self._config.acceleration.prope_image_width,
                 image_height=self._config.acceleration.prope_image_height,
             )
@@ -608,7 +699,38 @@ class LtxvTrainer:
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
 
+        self._load_action_projector_checkpoint(checkpoint_path)
+
         self._resume_state = self._resolve_resume_state()
+
+    def _load_action_projector_checkpoint(self, checkpoint_path: Path) -> None:
+        """Restore action-projector weights saved alongside a LoRA/full checkpoint.
+
+        The projector is a standalone module (not inside the transformer), so it is not
+        part of the LoRA/full state dict. Called from _load_checkpoint() before the
+        accelerator wraps the projector, so we load straight into the bare module.
+        Missing file (e.g. checkpoints saved before this fix) is non-fatal — the projector
+        then keeps its fresh init, matching the previous behaviour.
+        """
+        if self._action_projector is None:
+            return
+        match = re.search(r"step_(\d+)", checkpoint_path.name)
+        if not match:
+            return
+        proj_path = checkpoint_path.parent / f"action_projector_step_{match.group(1)}.safetensors"
+        if not proj_path.exists():
+            logger.warning(
+                f"⚠️ use_action_cond=True but no action projector found at {proj_path}. "
+                "The projector will start from a fresh init (expected for checkpoints saved "
+                "before action-projector persistence was added)."
+            )
+            return
+        state = load_file(str(proj_path))
+        missing, unexpected = self._action_projector.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            logger.warning(f"⚠️ Action projector load mismatch: missing={missing}, unexpected={unexpected}")
+        else:
+            logger.info(f"✅ Action projector loaded from {proj_path.name}")
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -742,8 +864,14 @@ class LtxvTrainer:
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
-        # Keep frozen models on CPU for memory efficiency
-        self._vae_decoder = self._vae_decoder.to("cpu")
+        # Keep frozen models on CPU for memory efficiency — EXCEPT the VAE decoder when
+        # Perceptual Flow Matching is on, which needs it on GPU + in the autograd graph
+        # every step (~6 GB for a full 33-frame clip; measured on H200).
+        if self._pfm_enabled():
+            self._vae_decoder = self._vae_decoder.to(self._accelerator.device)
+            logger.info("PFM: VAE decoder kept on GPU for perceptual loss.")
+        else:
+            self._vae_decoder = self._vae_decoder.to("cpu")
         if self._vae_encoder is not None:
             self._vae_encoder = self._vae_encoder.to("cpu")
 
@@ -1201,6 +1329,20 @@ class LtxvTrainer:
 
         self._checkpoint_paths.append(saved_weights_path)
         self._cleanup_checkpoints()
+
+        # The action-cond projector lives OUTSIDE the transformer, so neither the PEFT
+        # LoRA state dict nor the full transformer state dict above captures it. Persist
+        # it next to the weights so (a) resume continues training it instead of silently
+        # re-initialising it from scratch every requeue, and (b) inference can load it.
+        if self._action_projector is not None:
+            proj = self._accelerator.unwrap_model(self._action_projector)
+            proj_state = {k: v.to(save_dtype) for k, v in proj.state_dict().items()}
+            proj_path = save_dir / f"action_projector_step_{self._global_step:05d}.safetensors"
+            save_file(proj_state, proj_path, metadata={"action_dim": str(self._config.acceleration.action_dim)})
+            logger.info(
+                f"💾 Action projector for step {self._global_step} saved in "
+                f"{proj_path.relative_to(self._config.output_dir)}"
+            )
 
         self._save_training_state(save_dir)
 

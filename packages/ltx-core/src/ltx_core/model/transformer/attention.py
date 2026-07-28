@@ -3,7 +3,7 @@ from typing import Protocol
 
 import torch
 
-from ltx_core.model.transformer.prope import PropeDotProductAttention
+from ltx_core.model.transformer.prope import PropeAttention
 from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
 memory_efficient_attention = None
@@ -149,10 +149,13 @@ class Attention(torch.nn.Module):
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
         apply_gated_attention: bool = False,
         use_prope: bool = False,
-        prope_patches_x: int | None = None,
-        prope_patches_y: int | None = None,
+        prope_proj_dim: int | None = None,
         prope_image_width: int | None = None,
         prope_image_height: int | None = None,
+        prope_max_pos: list[int] | None = None,
+        prope_theta: float = 10000.0,
+        prope_use_middle_indices_grid: bool = False,
+        prope_double_precision_rope: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -183,25 +186,31 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
-        # PRoPE — opt-in multi-view camera-relative positional encoding for GVT.
-        # When use_prope=True, the standard apply_rotary_emb call on (q, k) is replaced
-        # with PRoPE's Q/K/O transforms derived from per-tile (viewmats, Ks). The viewmats
-        # and Ks are passed in at forward time so they can vary per batch; the patches-per-tile
-        # geometry is fixed at module init.
+        # PRoPE — opt-in camera-relative positional encoding for GVT multi-view video.
+        # When use_prope=True AND per-token cameras are supplied at forward time, the
+        # head is split block-diagonally: the first `dim_head - prope_proj_dim` dims get
+        # the native 3D RoPE (time/height/width, preserving temporal position), and the
+        # last `prope_proj_dim` dims get the per-token projective camera transform. See
+        # prope.PropeAttention. When viewmats is None at forward time the layer falls back
+        # to the vanilla full-head RoPE path, so use_prope=True is safe before cameras flow.
         self.use_prope = use_prope
         if use_prope:
             for name, val in {
-                "prope_patches_x": prope_patches_x,
-                "prope_patches_y": prope_patches_y,
+                "prope_proj_dim": prope_proj_dim,
                 "prope_image_width": prope_image_width,
                 "prope_image_height": prope_image_height,
             }.items():
                 if val is None:
                     raise ValueError(f"{name} is required when use_prope=True")
-            self.prope = PropeDotProductAttention(
+            self.prope = PropeAttention(
                 head_dim=dim_head,
-                patches_x=prope_patches_x,
-                patches_y=prope_patches_y,
+                proj_dim=prope_proj_dim,
+                num_heads=heads,
+                max_pos=prope_max_pos if prope_max_pos is not None else [20, 2048, 2048],
+                positional_embedding_theta=prope_theta,
+                rope_type=rope_type,
+                use_middle_indices_grid=prope_use_middle_indices_grid,
+                double_precision_rope=prope_double_precision_rope,
                 image_width=prope_image_width,
                 image_height=prope_image_height,
             )
@@ -219,6 +228,7 @@ class Attention(torch.nn.Module):
         all_perturbed: bool = False,
         viewmats: torch.Tensor | None = None,
         Ks: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multi-head attention with optional RoPE, perturbation masking, and per-head gating.
         When ``perturbation_mask`` is all zeros, the expensive query/key path
@@ -258,28 +268,25 @@ class Attention(torch.nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            # PRoPE path: skip apply_rotary_emb on q/k and use PRoPE's Q/K/V/O transforms.
-            # Falls back to the vanilla RoPE path when use_prope=False OR no cameras given.
-            if self.use_prope and viewmats is not None:
+            # PRoPE path: split the head into a 3D-RoPE block + a per-token projective
+            # camera block (see prope.PropeAttention). Requires per-token cameras AND the
+            # raw positions grid; falls back to vanilla full-head RoPE when either is absent
+            # (so use_prope=True is a no-op until the dataloader carries cameras).
+            if self.use_prope and viewmats is not None and positions is not None:
                 b, t, _ = q.shape
                 # Reshape (B, T, H*D) -> (B, H, T, D) for PRoPE.
                 q4 = q.view(b, t, self.heads, self.dim_head).transpose(1, 2)
                 k4 = k.view(b, t, self.heads, self.dim_head).transpose(1, 2)
                 v4 = v.view(b, t, self.heads, self.dim_head).transpose(1, 2)
-                self.prope._precompute_and_cache_apply_fns(viewmats, Ks)
-                q4 = self.prope._apply_to_q(q4)
-                k4 = self.prope._apply_to_kv(k4)
-                v4 = self.prope._apply_to_kv(v4)
                 attn_mask_4d = mask
                 if attn_mask_4d is not None:
                     if attn_mask_4d.ndim == 2:
                         attn_mask_4d = attn_mask_4d.unsqueeze(0)
                     if attn_mask_4d.ndim == 3:
                         attn_mask_4d = attn_mask_4d.unsqueeze(1)
-                o4 = torch.nn.functional.scaled_dot_product_attention(
-                    q4, k4, v4, attn_mask=attn_mask_4d, dropout_p=0.0, is_causal=False
+                o4 = self.prope(
+                    q4, k4, v4, viewmats=viewmats, Ks=Ks, positions=positions, attn_mask=attn_mask_4d
                 )
-                o4 = self.prope._apply_to_o(o4)
                 out = o4.transpose(1, 2).reshape(b, t, self.heads * self.dim_head)
             else:
                 if pe is not None:

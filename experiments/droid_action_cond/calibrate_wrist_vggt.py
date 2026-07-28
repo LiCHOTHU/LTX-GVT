@@ -28,6 +28,21 @@ import os
 import sys
 from pathlib import Path
 
+# Fix HF cache BEFORE any huggingface_hub import. The user's .bashrc sets
+# HF_HOME=${XDG_CACHE_HOME}/huggingface, which on slurm compute nodes (no
+# XDG_CACHE_HOME) expands to "/huggingface" — unwritable. Anything <= a single
+# leading slash or pointing under /huggingface is treated as bogus and replaced
+# with the project HF cache where VGGT-1B is pre-downloaded.
+_HF_FALLBACK = "/storage/project/r-agarg35-0/lwang831/hf_cache"
+_hf = os.environ.get("HF_HOME", "")
+if (not _hf) or _hf == "/" or _hf.startswith("/huggingface"):
+    os.environ["HF_HOME"] = _HF_FALLBACK
+# HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE override HF_HOME silently if set badly.
+for _k in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+    _v = os.environ.get(_k, "")
+    if _v and (_v == "/" or _v.startswith("/huggingface")):
+        os.environ.pop(_k, None)
+
 import numpy as np
 import torch
 from PIL import Image
@@ -42,6 +57,16 @@ _HERE = Path(__file__).parent
 WRIST_ROOT = Path(os.environ.get("WRIST_DATA_ROOT", _HERE / "outputs" / "context"))
 OUT_DIR = Path(os.environ.get("WRIST_CALIB_OUT", _HERE / "outputs" / "wrist_calib_vggt"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Optional filter: short-id list. If set, only these directories under
+# WRIST_ROOT are processed (used by the resumable orchestrator). Prefer the
+# file variant — a single env string > 128 KB hits Linux MAX_ARG_STRLEN.
+def _load_eps_filter() -> set[str]:
+    f = os.environ.get("VGGT_EPS_FILTER_FILE", "").strip()
+    if f and Path(f).exists():
+        return {ln.strip() for ln in Path(f).read_text().splitlines() if ln.strip()}
+    return {s.strip() for s in os.environ.get("VGGT_EPS_FILTER", "").split(",") if s.strip()}
+
+_EPS_FILTER = _load_eps_filter()
 
 
 def load_vggt():
@@ -147,6 +172,8 @@ def main():
     results = {}
     for ep_dir in sorted(WRIST_ROOT.iterdir()):
         if not (ep_dir / "data.npz").exists():
+            continue
+        if _EPS_FILTER and ep_dir.name not in _EPS_FILTER:
             continue
         print(f"\n=== {ep_dir.name} ===")
         info = json.loads((ep_dir / "info.json").read_text())

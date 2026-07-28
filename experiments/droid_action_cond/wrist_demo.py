@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 CALIB_DIR = Path(os.environ.get("DROID_CALIB_DIR", "/storage/project/r-agarg35-0/lwang831/droid/calibration"))
 DROID100 = Path(os.environ.get("DROID_RLDS_DIR", "/storage/project/r-agarg35-0/lwang831/droid/droid_100/1.0.0"))
-ROOT = Path(__file__).parent / "outputs" / "context"
+ROOT = Path(os.environ.get("WRIST_EXTRACT_OUT", Path(__file__).parent / "outputs" / "context"))
 ROOT.mkdir(parents=True, exist_ok=True)
 
 N_EPISODES = int(os.environ.get("WRIST_DEMO_N", 3))
@@ -80,7 +80,19 @@ def blend(gt: np.ndarray, render: np.ndarray, alpha: float = 0.85) -> np.ndarray
 def pick_episodes(builder, calib) -> list:
     from ltx_action_cond.droid import find_iou_calibrated_episodes
     ds = builder.as_dataset(split="train")
-    cands = find_iou_calibrated_episodes(ds, calib, min_quality=0.70)
+    # Streaming scan: WRIST_DEMO_MAX_SCAN caps how many episodes we look at
+    # before giving up. With droid_100 (100 eps total) the unbounded scan is
+    # fine, but on the full 95K-episode RLDS an unbounded scan reads >1 TB of
+    # TFRecord just to figure out which episodes are calibrated. Setting this
+    # to ~200 finds the first valid episodes in seconds and matches the
+    # ep_index space used by enumerate_universe.py --max_episodes.
+    max_scan = int(os.environ.get("WRIST_DEMO_MAX_SCAN", "0"))
+    if max_scan > 0:
+        ds = ds.take(max_scan)
+        print(f"  [pick] WRIST_DEMO_MAX_SCAN={max_scan}: limiting RLDS scan.")
+    # count_steps=False: skip per-episode step iteration that OOMs at 95K-scale
+    # (universe.json already has n_steps for chunks we'll actually build).
+    cands = find_iou_calibrated_episodes(ds, calib, min_quality=0.70, count_steps=False)
     # Filter: must have both ext cam intrinsics + wrist intrinsics + valid widths
     good = []
     for c in cands:
@@ -93,11 +105,18 @@ def pick_episodes(builder, calib) -> list:
         if not all(s in intr and intr[s].get("width", 0) > 0 for s in (ext1, ext2, wrist)):
             continue
         good.append(c)
-    # If WRIST_DEMO_EPS is set (comma-separated episode IDs), pick those in order.
-    # Otherwise fall back to seeded random sampling.
+    # If WRIST_DEMO_EPS_FILE (newline-list) or WRIST_DEMO_EPS (comma-list) is
+    # set, pick those in order. Prefer the file (single-env-string is capped at
+    # MAX_ARG_STRLEN = 128 KB on Linux). Otherwise fall back to seeded random.
+    eps_file = os.environ.get("WRIST_DEMO_EPS_FILE", "").strip()
     wanted = os.environ.get("WRIST_DEMO_EPS", "").strip()
-    if wanted:
+    if eps_file and Path(eps_file).exists():
+        wanted_ids = [ln.strip() for ln in Path(eps_file).read_text().splitlines() if ln.strip()]
+    elif wanted:
         wanted_ids = [e.strip() for e in wanted.split(",") if e.strip()]
+    else:
+        wanted_ids = []
+    if wanted_ids:
         by_id = {c.episode_id: c for c in good}
         out = [by_id[eid] for eid in wanted_ids if eid in by_id]
         missing = [eid for eid in wanted_ids if eid not in by_id]
@@ -124,16 +143,19 @@ def extract_pass() -> None:
     for c in picks:
         print(f"  IoU={c.quality:.3f}  T={c.n_steps:4d}  {c.episode_id}")
 
+    # Stream-process: caching all 10K+ episode dicts in RAM blew 48 GB and got
+    # SIGKILL'd by SLURM OOM. Iterate once, process each wanted ep inline, then
+    # let TFDS release it.
     wanted_idx = {c.ep_index: c for c in picks}
+    remaining = set(wanted_idx)
     ds = builder.as_dataset(split="train")
-    cached: dict[int, object] = {}
     for i, ep in enumerate(ds):
-        if i in wanted_idx:
-            cached[i] = ep
-        if len(cached) >= len(wanted_idx): break
-
-    for cand in picks:
-        ep = cached[cand.ep_index]
+        if not remaining:
+            break
+        if i not in wanted_idx:
+            continue
+        cand = wanted_idx[i]
+        remaining.discard(i)
         ep_id = cand.episode_id
         sers = calib.camera_serials[ep_id]
         ext1_s, ext2_s, wrist_s = sers["ext1_cam_serial"], sers["ext2_cam_serial"], sers["wrist_cam_serial"]

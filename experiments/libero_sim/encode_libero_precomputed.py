@@ -55,13 +55,7 @@ _DROID = _REPO / "experiments" / "droid_action_cond"
 sys.path.insert(0, str(_DROID))
 from build_dataset_resumable import (  # noqa: E402
     CHUNK_LEN,
-    FULL_H,
-    FULL_W,
-    TILE_H,
-    TILE_W,
     _output_looks_valid,
-    _tile_2x2,
-    _upscale_lanczos,
     atomic_replace,
     clean_partial_outputs,
     mark_done,
@@ -69,6 +63,18 @@ from build_dataset_resumable import (  # noqa: E402
     write_mp4_atomic,
     write_torch_atomic,
 )
+
+# 2-view tile geometry: agentview (left) | wrist (right), native 256x256 each,
+# horizontally concatenated -> 256x512 (H x W). Replaces the inherited DROID
+# 3-view 2x2 (1024x576) layout; deliberately NO upscale (raw native resolution).
+NEW_H, NEW_W = 256, 512
+
+
+def _hconcat2(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Horizontally concat two (F,H,W,C) uint8 view stacks -> (F,H,2W,C). No upscale."""
+    if left.shape != right.shape:
+        raise ValueError(f"view shape mismatch: {left.shape} vs {right.shape}")
+    return np.concatenate([left, right], axis=2)
 
 DEFAULT_MODEL_PATH = "/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/LTX-2.3/ltx-2.3-22b-distilled-1.1.safetensors"
 DEFAULT_TEXT_ENCODER_PATH = "/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/gemma-3-12b-it-qat-q4_0-unquantized"
@@ -79,8 +85,8 @@ def caption_for(task: str) -> str:
     task = (task or "").strip().rstrip(".")
     action = f" performing the task: {task}" if task else ""
     return (
-        f"A Franka robot arm with a parallel-jaw gripper{action}. Two fixed camera "
-        "views and a wrist camera view are shown in a 2x2 grid."
+        f"A Franka robot arm with a parallel-jaw gripper{action}. The agentview and "
+        "wrist camera views are shown side by side."
     )
 
 
@@ -98,16 +104,9 @@ def build_chunk_videos(npz_path: Path, cid: str, staging: Path) -> tuple[Path, P
     staging.mkdir(parents=True, exist_ok=True)
     d = dict(np.load(npz_path, allow_pickle=True))
 
-    target = _tile_2x2(
-        _upscale_lanczos(d["agentview_frames"], TILE_H, TILE_W),
-        _upscale_lanczos(d["frontview_frames"], TILE_H, TILE_W),
-        _upscale_lanczos(d["wrist_frames"], TILE_H, TILE_W),
-    )
-    reference = _tile_2x2(
-        _upscale_lanczos(d["agentview_context_robot"], TILE_H, TILE_W),
-        _upscale_lanczos(d["frontview_context_robot"], TILE_H, TILE_W),
-        _upscale_lanczos(d["wrist_context_fused"], TILE_H, TILE_W),
-    )
+    # 2-view layout: agentview (left) | wrist (right) at native 256x256 -> 256x512.
+    target = _hconcat2(d["agentview_frames"], d["wrist_frames"])
+    reference = _hconcat2(d["agentview_context_robot"], d["wrist_context_fused"])
 
     tgt = staging / f"{cid}_target.mp4"
     ref = staging / f"{cid}_reference.mp4"
@@ -166,7 +165,7 @@ def process_batch(batch: list[tuple[str, Path]], out_root: Path,
     pre_out = staging / "precomputed"
     cmd = [
         sys.executable, "-u", str(PROCESS_DATASET), str(dataset_json),
-        "--resolution-buckets", f"{FULL_W}x{FULL_H}x{CHUNK_LEN}",
+        "--resolution-buckets", f"{NEW_W}x{NEW_H}x{CHUNK_LEN}",
         "--model-path", model_path,
         "--text-encoder-path", text_encoder_path,
         "--reference-column", "reference_path",
@@ -198,9 +197,12 @@ def process_batch(batch: list[tuple[str, Path]], out_root: Path,
             for k in ("latents", "reference_latents", "conditions"):
                 atomic_replace(staged[k], final[k])
             write_torch_atomic({"latents": torch.from_numpy(actions_map[cid])}, final["actions"])
-            for k, p in final.items():
-                if not _output_looks_valid(p):
-                    raise RuntimeError(f"post-commit {k} unreadable: {p}")
+            # Validate ONLY what this script commits. `cameras` is produced by the
+            # separate build_libero_cameras.py pass (same as the GT set), so it is
+            # absent here and must not gate the commit.
+            for k in ("latents", "reference_latents", "conditions", "actions"):
+                if not _output_looks_valid(final[k]):
+                    raise RuntimeError(f"post-commit {k} unreadable: {final[k]}")
             mark_done(out_root, cid)
             n_committed += 1
         except Exception as exc:
@@ -286,7 +288,10 @@ def main() -> int:
         print(f"  batch {i//args.batch_size+1}: +{nb_c} (-{nb_f}) | total {committed}/{len(work)} "
               f"| {time.time()-t0:.0f}s", flush=True)
     print(f"\nDONE. committed={committed} failed={failed} elapsed={time.time()-t0:.0f}s")
-    return 0 if committed > 0 else 1
+    # Success == nothing failed. An empty work list (everything already encoded in a
+    # prior run -> 0 pending, committed=0) is a legitimate no-op, NOT a failure; only
+    # a real per-chunk failure should propagate a non-zero exit.
+    return 1 if failed > 0 else 0
 
 
 if __name__ == "__main__":

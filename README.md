@@ -182,6 +182,23 @@ The smoke test in this commit verifies that, given a video latent of `(B=2, T_vi
 
 For the 3-view (cam1 / cam2 / wrist) tiled output, vanilla spatial self-attention has no idea that the four tiles correspond to *different camera frustums* — it sees them as one 2D image. To get geometry-aware cross-view consistency for free, GVT vendors [PRoPE](https://arxiv.org/abs/2507.10496) ("Cameras as Relative Positional Encoding") and makes it an **opt-in flag**. The vanilla LTX-2 training and inference paths are byte-for-byte unchanged when PRoPE is off.
 
+### 3D RoPE ⊕ projective — *not* a replacement of RoPE
+
+The naive port did 2D `(x, y)` spatial RoPE that **replaced** the model's native 3D RoPE — silently discarding the temporal axis. That is wrong: LTX-2's positional encoding (time, height, width) carries real signal we must keep. The correct construction splits each attention head's `head_dim=128` into two **disjoint** sub-spaces and runs them block-diagonally:
+
+```
+head_dim = 128
+┌─────────────────────────────┬──────────────────────────┐
+│  [0 : d_rope)               │  [d_rope : 128)          │
+│  native 3D RoPE             │  per-token projective    │
+│  (time, height, width)      │  camera transform (PRoPE)│
+│  — untouched                │  — zero learnable params │
+└─────────────────────────────┴──────────────────────────┘
+        d_rope = head_dim - proj_dim
+```
+
+Disjoint sub-spaces are mandatory: mixing the projective block into the RoPE block corrupts both relative identities. With `proj_dim = 0` the module is bit-identical to vanilla 3D RoPE.
+
 ### Why PRoPE and not RayRoPE
 
 [RayRoPE](https://arxiv.org/abs/2601.15275) is the obvious cousin, but it (a) replaces `scaled_dot_product_attention` itself (breaks FlashAttention compatibility) and (b) introduces a learned per-token depth head (pure cold-start parameters that the LTX-2 checkpoint cannot help). PRoPE is geometry-only — **zero learnable parameters** — and applies as a Q/K/V/O transform around standard SDPA, so we can:
@@ -193,52 +210,55 @@ For the 3-view (cam1 / cam2 / wrist) tiled output, vanilla spatial self-attentio
 
 | Path | What it is |
 |---|---|
-| `packages/ltx-core/src/ltx_core/model/transformer/prope.py` | Vendored copy of the official PRoPE PyTorch implementation (MIT, unmodified). |
-| `packages/ltx-core/src/ltx_core/model/transformer/attention.py` | A guarded PRoPE branch in `Attention.forward`. |
+| `packages/ltx-core/src/ltx_core/model/transformer/prope.py` | `PropeAttention`: builds its own `d_rope`-sized 3D RoPE from `positions`, applies the projective block on `[d_rope:128)`. |
+| `packages/ltx-core/src/ltx_core/model/transformer/attention.py` | Guarded PRoPE branch in `Attention.forward` (reshape → `PropeAttention` → `to_out`). |
+| `packages/ltx-core/src/ltx_core/model/transformer/enable_prope.py` | `enable_prope_on_model` — post-hoc swap of each block's `attn1` after checkpoint load. |
 
 ### Turning it on
 
-`Attention` gains five constructor flags, all defaulted so existing callsites are unchanged:
+`Attention` gains PRoPE constructor flags, all defaulted so existing callsites are unchanged:
 
 ```python
 Attention(
     query_dim=..., heads=..., dim_head=...,
     use_prope=True,                # default False — toggle PRoPE on
-    prope_patches_x=PX,            # per-tile patch grid width (e.g. 16 at 512×288)
-    prope_patches_y=PY,            # per-tile patch grid height (e.g. 9 at 512×288)
+    prope_proj_dim=64,             # projective sub-space width (mult. of 4, < head_dim);
+                                   #   the remaining head_dim - proj_dim stays 3D RoPE
     prope_image_width=IMG_W,       # per-tile pixel width  (used to normalise K)
     prope_image_height=IMG_H,      # per-tile pixel height
 )
 ```
 
-At forward time the per-batch camera tensors are passed in:
+At forward time the per-**token** camera tensors and RoPE `positions` are passed in:
 
 ```python
-attn(x, pe=pe, viewmats=(B, cams, 4, 4), Ks=(B, cams, 3, 3))
+attn(x, viewmats=(B, T, 4, 4), Ks=(B, T, 3, 3), positions=(B, 3, T, 2))
 ```
 
-If `viewmats` is `None` (or `use_prope=False`), the call takes the vanilla path with no overhead. So a single `--use_prope` flag at the trainer level can flip every `Attention` module while keeping the rest of the dataloader / pipeline exactly the same — just make sure the dataloader provides `viewmats`/`Ks` when the flag is on.
+Note these are **per-token** (one camera per sequence position), not per-view — the dataloader expands the 3 physical views to per-token cameras by tile membership. If `viewmats`/`positions` are `None` (or `use_prope=False`), the call takes the vanilla full-head RoPE path with no overhead, so flipping `--use_prope` is safe before cameras flow.
 
-For the 2×2 tiled layout: `cams=4`, `[cam1, cam2, BLANK, wrist]`. The blank tile gets a dummy camera (e.g. identity extrinsic, identity intrinsic) and its tokens are loss-masked downstream so the model isn't penalised for whatever it puts there.
+### Dataloader contract
+
+When `use_prope` is on, `VideoToVideoStrategy.get_data_sources()` adds a `cameras` source. Each sample provides:
+
+```
+cameras/<id>.pt = {"viewmats": (V, 4, 4), "Ks": (V, 3, 3)}   # V = 3, order [ext1, ext2, wrist]
+```
+
+`Ks` are in per-tile pixel resolution. `_build_per_token_cameras()` then maps every token to its tile by `positions` (TL=ext1, TR=ext2, BR=wrist, BL=blank) and scatters the matching camera; the blank tile and the action tokens get an **identity** camera (`P = I`, a no-op in attention) and are loss-masked downstream.
 
 ### Verified properties
 
-A smoke test under `conda env ltx` confirms:
-1. `use_prope=False` constructor produces a `state_dict` with **the same 10 keys** as the pre-PRoPE module — stock LTX-2 checkpoints load unchanged.
-2. `attn(x)` and `attn(x, context=ctx)` with no `viewmats` keep the original calling conventions.
-3. Vanilla weights load into a `use_prope=True` module with `missing=[]` and `unexpected=[]` — full bidirectional checkpoint compat.
-4. `use_prope=True` with no `viewmats` passed at forward auto-falls back to the vanilla path.
-5. `use_prope=True` adds **zero learnable parameters** (paper claim verified: 16,768 == 16,768 in our minimal config).
+CPU property + integration tests (`packages/ltx-core/tests/`, `packages/ltx-trainer/tests/`) confirm:
+1. **Identity cameras reduce to partial 3D RoPE** (err 0) — the projective block is an exact no-op when `P = I`.
+2. **Temporal structure is live** — distinct per-token times change the output (diff 1.3); a uniform time shift cancels (relative encoding), proving native 3D RoPE survives.
+3. **Gauge invariance** — a global world-frame change leaves attention logits unchanged (rel err 6e-8 without intrinsics, 1.3e-7 with).
+4. **Fallback** — `use_prope=True` with no cameras is numerically identical to vanilla RoPE (err 0).
+5. **Per-token camera builder** — quadrant→view mapping is exact; action + blank tokens → identity; missing `cameras` → `(None, None)`.
 
 ### What's left to wire up
 
-The Attention layer is ready to accept `viewmats`/`Ks`. To make the full `--use_prope` training flag actually flow these values end-to-end you still need to:
-- Add `use_prope` to `TransformerArgs` and the trainer config.
-- Extend `Modality` (or add a sibling tensor) to carry `viewmats`/`Ks` from the dataloader.
-- Thread them through the transformer's block loop into each `Attention.forward` call.
-- Train a Q/K LoRA on the resulting model to absorb the positional-encoding shift.
-
-These are mechanical (no further attention-kernel surgery) and intentionally left for the trainer integration pass.
+The model and dataloader paths are complete end-to-end. The remaining piece is **data generation**: the dataset build (`chunk_context` / `build_dataset_resumable`) does not yet emit `cameras/<id>.pt`. The values are derivable from `K1, K2, K_wrist`, `cam2base_1/2`, `T_cam_to_hand` and per-frame FK — a per-frame wrist camera is a high-value refinement over a static one. Then train a Q/K LoRA to absorb the positional-encoding shift.
 
 ## Wrist-camera calibration (separate concern)
 

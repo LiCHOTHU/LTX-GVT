@@ -76,6 +76,13 @@ class VideoToVideoStrategy(TrainingStrategy):
         accel = getattr(self, "_acceleration_config", None)
         if accel is not None and getattr(accel, "use_action_cond", False):
             sources["actions"] = "actions"
+        # PRoPE needs per-sample cameras. Each ``cameras/<id>.pt`` holds
+        # {"viewmats": (V, F, 4, 4) world-to-camera, "Ks": (V, 3, 3)} for the V views in
+        # canonical order [agentview, wrist] (matching encode's _hconcat2: left tile =
+        # agentview, right tile = wrist). viewmats are per-frame (the full trajectory);
+        # Ks are time-invariant, at per-tile pixel resolution (prope_image_width × height).
+        if accel is not None and getattr(accel, "use_prope", False):
+            sources["cameras"] = "cameras"
         return sources
 
     def prepare_training_inputs(  # noqa: PLR0915
@@ -135,6 +142,11 @@ class VideoToVideoStrategy(TrainingStrategy):
             ref_latents = warp_latent(
                 ref_latents, src_K=eye_K, src_T=eye_T, tgt_K=eye_K, tgt_T=eye_T, depth=flat_depth
             )
+
+        # Capture target latent grid (F, H, W) before patchify so a pixel-space loss
+        # (Perceptual Flow Matching) can unpatchify + decode the target tokens.
+        _, _, _fL, _hL, _wL = target_latents.shape
+        video_latent_grid = (int(_fL), int(_hL), int(_wL))
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         target_latents = self._video_patchifier.patchify(target_latents)
@@ -272,13 +284,23 @@ class VideoToVideoStrategy(TrainingStrategy):
             action_positions = action_positions.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
             positions = torch.cat([positions, action_positions], dim=2)
 
-        # PRoPE viewmats/Ks: leave None for the verification path. The Attention layer
-        # auto-falls back to vanilla RoPE when viewmats is None, so use_prope=True does
-        # NOT change the forward numerics here. When the preprocessed dataset is extended
-        # to carry per-tile (K, T), populate `batch["viewmats"]` / `batch["Ks"]` upstream
-        # and pass them through as (B, C, 4, 4) / (B, C, 3, 3) tensors below.
-        prope_viewmats = batch.get("viewmats") if isinstance(batch, dict) else None
-        prope_Ks = batch.get("Ks") if isinstance(batch, dict) else None
+        # PRoPE per-token cameras. Expand the per-view cameras (from the "cameras" data
+        # source) to one (viewmat, K) per token of `combined_latents`, mapping each video
+        # token to its tile via `positions`. Returns (None, None) when use_prope is off or
+        # the dataset carries no cameras — the Attention layer then auto-falls back to the
+        # vanilla full-head RoPE path, so use_prope=True stays numerically safe.
+        prope_viewmats, prope_Ks = self._build_per_token_cameras(
+            batch=batch,
+            positions=positions,
+            latent_height=height,
+            latent_width=width,
+            num_frames=num_frames,
+            ref_seq_len=ref_seq_len,
+            target_seq_len=target_seq_len,
+            action_seq_len=action_seq_len,
+            device=device,
+            dtype=dtype,
+        )
 
         # Create video Modality
         video_modality = Modality(
@@ -310,7 +332,137 @@ class VideoToVideoStrategy(TrainingStrategy):
             video_loss_mask=video_loss_mask,
             audio_loss_mask=None,
             ref_seq_len=ref_seq_len,
+            video_latent_grid=video_latent_grid,
         )
+
+    # Latent -> pixel spatial compression (see SpatioTemporalScaleFactors.default()).
+    _SPATIAL_SCALE = 32
+    # Canonical view order for the 2-view LIBERO layout, matching encode's
+    # _hconcat2(agentview, wrist): left tile = agentview (0), right tile = wrist (1).
+    _N_VIEWS = 2
+
+    def _build_per_token_cameras(
+        self,
+        *,
+        batch: dict[str, Any],
+        positions: Tensor,
+        latent_height: int,
+        latent_width: int,
+        num_frames: int,
+        ref_seq_len: int,
+        target_seq_len: int,
+        action_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Expand per-frame, per-view cameras to one (viewmat, K) per token of ``combined_latents``.
+
+        Two alignment axes per video token:
+          * VIEW (which camera) from the width pixel coordinate in ``positions``: the
+            canvas is agentview|wrist left|right (encode's _hconcat2), so a token whose
+            width-midpoint is in the left half -> agentview (0), right half -> wrist (1).
+            This holds for BOTH the reference and target blocks (same L|R layout).
+          * FRAME (which pose along the trajectory) from the token's latent-frame index,
+            recovered by patch ordering ``(f, h, w)`` within each block. The stored
+            per-frame poses (V, F_src, 4, 4) are decimated to the ``num_frames`` latent
+            frames with the SAME ``linspace(0, F_src-1, num_frames).round()`` used to
+            resample the action tokens, so camera / action / video stay on one grid.
+
+        Appended action tokens (and any token we can't confidently place) get an identity
+        camera (``P = I``) so the projective block is a no-op there. Returns ``(None, None)``
+        when PRoPE is off or the batch carries no ``cameras`` source (-> vanilla RoPE
+        fallback in attention, so use_prope=True is safe before cameras flow).
+
+        Args:
+            positions: (B, 3, T, 2) coordinate grid for the *full* sequence (ref+target+action).
+            latent_height/latent_width: target latent dims (the view split is at full_w/2).
+            num_frames: latent frame count (== target latent frames).
+            ref_seq_len/target_seq_len: token counts of the reference / target blocks.
+            action_seq_len: number of action-cond tokens appended at the end of the sequence.
+        """
+        accel = getattr(self, "_acceleration_config", None)
+        if accel is None or not getattr(accel, "use_prope", False):
+            return None, None
+        cams = batch.get("cameras") if isinstance(batch, dict) else None
+        if cams is None:
+            return None, None
+        if not (isinstance(cams, dict) and "viewmats" in cams and "Ks" in cams):
+            raise ValueError("cameras source must be a dict with 'viewmats' (B,V,F,4,4) and 'Ks' (B,V,3,3)")
+
+        viewmats_src = cams["viewmats"].to(device=device, dtype=dtype)  # (B, V, F_src, 4, 4)
+        Ks_src = cams["Ks"].to(device=device, dtype=dtype)  # (B, V, 3, 3)
+        # Accept a static per-view schema (B, V, 4, 4) too -> treat as a single frame.
+        if viewmats_src.dim() == 4 and tuple(viewmats_src.shape[-2:]) == (4, 4):
+            viewmats_src = viewmats_src.unsqueeze(2)  # (B, V, 1, 4, 4)
+        if viewmats_src.dim() != 5 or tuple(viewmats_src.shape[-2:]) != (4, 4):
+            raise ValueError(f"cameras.viewmats must be (B, V, F, 4, 4), got {tuple(viewmats_src.shape)}")
+        if Ks_src.dim() != 4 or tuple(Ks_src.shape[-2:]) != (3, 3):
+            raise ValueError(f"cameras.Ks must be (B, V, 3, 3), got {tuple(Ks_src.shape)}")
+        B, V, F_src = viewmats_src.shape[:3]
+        if V < self._N_VIEWS:
+            raise ValueError(f"PRoPE expects >= {self._N_VIEWS} views [agentview, wrist], got V={V}")
+        T = positions.shape[2]
+
+        # Decimate the stored per-frame poses to the latent-frame count, EXACTLY as the
+        # action tokens are resampled (linspace endpoints, rounded) -> shared temporal grid.
+        if F_src >= num_frames:
+            cam_idx = torch.linspace(0, F_src - 1, steps=num_frames, device=device).round().long()
+        else:
+            cam_idx = torch.arange(num_frames, device=device).clamp(max=F_src - 1)
+        viewmats_lat = viewmats_src[:, :, cam_idx]  # (B, V, num_frames, 4, 4)
+
+        # VIEW per token from the width pixel midpoint (left half -> agentview, right -> wrist).
+        n_video = T - action_seq_len
+        w_mid = (positions[:, 2, :, 0] + positions[:, 2, :, 1]) * 0.5  # (B, T)
+        half_w = latent_width * self._SPATIAL_SCALE * 0.5
+        left = w_mid < half_w
+        is_video = torch.zeros(B, T, dtype=torch.bool, device=device)
+        is_video[:, :n_video] = True
+        view_idx = torch.full((B, T), -1, dtype=torch.long, device=device)
+        view_idx[is_video & left] = 0  # agentview (left tile)
+        view_idx[is_video & ~left] = 1  # wrist (right tile)
+
+        # FRAME per token from patch ordering (f, h, w) within each block. A block whose
+        # token count isn't divisible by num_frames is left as identity (view -1) rather
+        # than risk a misaligned pose.
+        frame_idx = torch.zeros(B, T, dtype=torch.long, device=device)
+        tok = torch.arange(T, device=device)
+        if ref_seq_len > 0:
+            if ref_seq_len % num_frames == 0:
+                hw_ref = ref_seq_len // num_frames
+                m = tok < ref_seq_len
+                frame_idx[:, m] = (tok[m] // hw_ref)
+            else:
+                view_idx[:, :ref_seq_len] = -1
+        tgt_end = ref_seq_len + target_seq_len
+        if target_seq_len > 0:
+            if target_seq_len % num_frames == 0:
+                hw_tgt = target_seq_len // num_frames
+                m = (tok >= ref_seq_len) & (tok < tgt_end)
+                frame_idx[:, m] = ((tok[m] - ref_seq_len) // hw_tgt)
+            else:
+                view_idx[:, ref_seq_len:tgt_end] = -1
+        frame_idx = frame_idx.clamp_(0, num_frames - 1)
+
+        # Identity camera for -1 tokens: viewmat = I and a K that normalises to identity,
+        # so P = lift(K_norm) @ I = I. K_norm = I  <=>  K = diag(IW, IH, 1) with cx=IW/2, cy=IH/2.
+        iw = float(accel.prope_image_width)
+        ih = float(accel.prope_image_height)
+        eye_vm = torch.eye(4, device=device, dtype=dtype)
+        ident_k = torch.tensor(
+            [[iw, 0.0, 0.5 * iw], [0.0, ih, 0.5 * ih], [0.0, 0.0, 1.0]], device=device, dtype=dtype
+        )
+        viewmats = eye_vm.view(1, 1, 4, 4).expand(B, T, 4, 4).clone()
+        Ks = ident_k.view(1, 1, 3, 3).expand(B, T, 3, 3).clone()
+
+        valid = view_idx >= 0  # (B, T)
+        if bool(valid.any()):
+            b_idx, t_idx = valid.nonzero(as_tuple=True)
+            v_sel = view_idx[b_idx, t_idx]
+            f_sel = frame_idx[b_idx, t_idx]
+            viewmats[b_idx, t_idx] = viewmats_lat[b_idx, v_sel, f_sel]
+            Ks[b_idx, t_idx] = Ks_src[b_idx, v_sel]
+        return viewmats, Ks
 
     def compute_loss(
         self,

@@ -231,6 +231,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     all_perturbed=all_perturbed,
                     viewmats=video.viewmats,
                     Ks=video.Ks,
+                    positions=video.positions,
                 )
                 * vgate_msa
             )

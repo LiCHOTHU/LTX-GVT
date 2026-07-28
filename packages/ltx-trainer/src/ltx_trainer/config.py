@@ -180,15 +180,17 @@ class AccelerationConfig(ConfigBaseModel):
     use_prope: bool = Field(
         default=False,
         description="Enable PRoPE (Cameras as Relative Positional Encoding) for the video "
-        "self-attention layers. Adds geometry-aware cross-tile attention with zero learnable "
-        "params. Requires the dataloader to provide per-sample viewmats (B, C, 4, 4) and Ks "
-        "(B, C, 3, 3); when absent the attention layer auto-falls back to the vanilla path.",
+        "self-attention layers. Splits each head into a native 3D-RoPE block (preserves "
+        "time/height/width position) and a per-token projective camera block (geometry-aware "
+        "cross-view attention, zero learnable params). Requires the dataloader to provide "
+        "per-token viewmats (B, T, 4, 4) and Ks (B, T, 3, 3); when absent the attention layer "
+        "auto-falls back to the vanilla full-head RoPE path.",
     )
-    prope_patches_x: int | None = Field(
-        default=None, description="Per-tile patch grid width. Required when use_prope=True."
-    )
-    prope_patches_y: int | None = Field(
-        default=None, description="Per-tile patch grid height. Required when use_prope=True."
+    prope_proj_dim: int | None = Field(
+        default=None,
+        description="Per-head channels reserved for the PRoPE projective camera block (multiple "
+        "of 4, < attention_head_dim). The remaining head_dim - prope_proj_dim channels keep the "
+        "native 3D RoPE. Required when use_prope=True. Typical: 64 (half of head_dim=128).",
     )
     prope_image_width: int | None = Field(
         default=None, description="Per-tile pixel width (used to normalise K). Required when use_prope=True."
@@ -223,8 +225,10 @@ class AccelerationConfig(ConfigBaseModel):
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
 
-    preprocessed_data_root: str = Field(
-        description="Path to folder containing preprocessed training data",
+    preprocessed_data_root: str | list[str] = Field(
+        description="Path to folder containing preprocessed training data, or a list of "
+        "such folders whose samples are concatenated (e.g. an immutable base root plus a "
+        "small per-round additions root, avoiding a symlink mirror).",
     )
 
     num_dataloader_workers: int = Field(

@@ -57,6 +57,11 @@ class ModelInputs:
     # Metadata needed for loss computation in some strategies
     ref_seq_len: int | None = None  # For IC-LoRA: length of reference sequence
 
+    # Target latent grid (F, H, W) at latent resolution — lets a pixel-space loss
+    # (e.g. Perceptual Flow Matching) unpatchify the target tokens back to [B, C, F, H, W]
+    # and decode them. None unless the strategy populates it. Channels are always 128.
+    video_latent_grid: tuple[int, int, int] | None = None
+
 
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.

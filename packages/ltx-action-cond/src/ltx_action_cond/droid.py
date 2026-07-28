@@ -81,6 +81,7 @@ def find_iou_calibrated_episodes(
     calib: CalibrationIndex,
     *,
     min_quality: float = 0.0,
+    count_steps: bool = True,
 ) -> list[CandidateEpisode]:
     """Scan an RLDS dataset split and return episodes that have an IoU-calibrated
     exterior view in the April 2025 release.
@@ -105,7 +106,11 @@ def find_iou_calibrated_episodes(
         serial = next((s for s in digit_keys if s in calib.intrinsics[ep_id]), None)
         if serial is None:
             continue
-        n_steps = sum(1 for _ in ep["steps"])
+        # Iterating ep["steps"] forces TFDS to materialize all 3-camera frames
+        # (~30 MB per episode) for every one of the 95K DROID episodes, which
+        # OOM-kills a 48 GB worker. Skip when caller doesn't need n_steps
+        # (extract / augment paths use the universe.json count instead).
+        n_steps = sum(1 for _ in ep["steps"]) if count_steps else 0
         out.append(CandidateEpisode(
             ep_index=i, episode_id=ep_id, relpath=relpath,
             serial=serial, quality=q, n_steps=n_steps,

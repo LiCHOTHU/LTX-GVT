@@ -31,6 +31,8 @@ class TransformerArgs:
     # PRoPE inputs propagated from Modality, see modality.py for shapes/semantics.
     viewmats: torch.Tensor | None = None
     Ks: torch.Tensor | None = None
+    # Raw positional coordinate grid (B, n_axes, T, 2), needed by PRoPE's 3D-RoPE block.
+    positions: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -190,6 +192,7 @@ class TransformerArgsPreprocessor:
             self_attention_mask=self_attention_mask,
             viewmats=modality.viewmats,
             Ks=modality.Ks,
+            positions=modality.positions,
         )
 
 

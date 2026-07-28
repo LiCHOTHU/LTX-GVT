@@ -85,11 +85,17 @@ class DummyDataset(Dataset):
 
 
 class PrecomputedDataset(Dataset):
-    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+    def __init__(
+        self, data_root: str | list[str], data_sources: dict[str, str] | list[str] | None = None
+    ) -> None:
         """
         Generic dataset for loading precomputed data from multiple sources.
         Args:
-            data_root: Root directory containing preprocessed data
+            data_root: Root directory containing preprocessed data, OR a list of such
+              roots. With a list, samples from every root are concatenated (each root
+              is scanned independently and must hold all configured sources for its
+              own files). This lets training read an immutable base root plus a small
+              per-round additions root without materializing a symlink mirror.
             data_sources: Either:
               - Dict mapping directory names to output keys
               - List of directory names (keys will equal values)
@@ -107,9 +113,9 @@ class PrecomputedDataset(Dataset):
         """
         super().__init__()
 
-        self.data_root = self._setup_data_root(data_root)
+        roots = list(data_root) if isinstance(data_root, (list, tuple)) else [data_root]
+        self.data_roots = [self._setup_data_root(r) for r in roots]
         self.data_sources = self._normalize_data_sources(data_sources)
-        self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
 
@@ -141,39 +147,57 @@ class PrecomputedDataset(Dataset):
         else:
             raise TypeError(f"data_sources must be dict, list, or None, got {type(data_sources)}")
 
-    def _setup_source_paths(self) -> dict[str, Path]:
-        """Map data source names to their actual directory paths."""
-        source_paths = {}
+    def _source_paths_for_root(self, root: Path) -> dict[str, Path] | None:
+        """Map each data-source name to its dir under `root`.
 
+        Returns None if `root` is missing any required source dir (e.g. an additions
+        root not yet populated) — such a root is skipped rather than aborting setup,
+        so an empty/partial root is tolerated as long as some root has the data.
+        """
+        source_paths: dict[str, Path] = {}
         for dir_name in self.data_sources:
-            source_path = self.data_root / dir_name
-            source_paths[dir_name] = source_path
-
-            # Check that all sources exist.
+            source_path = root / dir_name
             if not source_path.exists():
-                raise FileNotFoundError(f"Required {dir_name} directory does not exist: {source_path}")
-
+                logger.info(f"Skipping data root {root}: missing source '{dir_name}'")
+                return None
+            source_paths[dir_name] = source_path
         return source_paths
 
     def _discover_samples(self) -> dict[str, list[Path]]:
-        """Discover all valid sample files across all data sources.
-        Uses a fast two-pass approach: first globs all sources in parallel to build
-        full-path sets in memory, then checks expected paths via set membership.
-        This avoids O(N * num_sources) stat calls on networked filesystems while
-        correctly handling path remapping (e.g. latent_X.pt -> condition_X.pt).
+        """Discover valid samples across ALL data roots, returning ABSOLUTE paths.
+
+        Each root is scanned independently with the same fast two-pass cross-source
+        matching, then results are concatenated (root order preserved so every output
+        key stays in lockstep). Storing absolute paths is what lets samples come from
+        different roots (e.g. an immutable base root + a small per-round additions
+        root) without a symlink mirror.
         """
         if not self.data_sources:
             raise ValueError("No data sources configured")
 
-        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
-        data_path = self.source_paths[data_key]
+        merged: dict[str, list[Path]] = {output_key: [] for output_key in self.data_sources.values()}
+        for root in self.data_roots:
+            source_paths = self._source_paths_for_root(root)
+            if source_paths is None:
+                continue
+            per_root = self._discover_in_root(source_paths)
+            for output_key, files in per_root.items():
+                merged[output_key].extend(files)
+        return merged
 
-        # Pass 1: Glob all sources in parallel, build full-path sets
+    def _discover_in_root(self, source_paths: dict[str, Path]) -> dict[str, list[Path]]:
+        """Fast two-pass cross-source sample discovery within one root -> ABSOLUTE paths.
+
+        Globs all sources in parallel to build full-path sets, then matches the
+        primary source against the others by set membership (no O(N*sources) stats).
+        """
+        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
+        data_path = source_paths[data_key]
+
         def _glob_source(dir_name: str) -> tuple[list[Path], set[str]]:
-            source_path = self.source_paths[dir_name]
+            source_path = source_paths[dir_name]
             paths = list(source_path.glob("**/*.pt"))
-            path_set = {str(p) for p in paths}
-            return paths, path_set
+            return paths, {str(p) for p in paths}
 
         with ThreadPoolExecutor(max_workers=len(self.data_sources)) as executor:
             glob_results = dict(
@@ -184,52 +208,45 @@ class PrecomputedDataset(Dataset):
                 )
             )
 
-        # Get primary source files (cached from glob, no second scan)
+        # Primary source files (may be empty for a not-yet-populated root -> 0 samples).
         data_files, _ = glob_results[data_key]
-        if not data_files:
-            raise ValueError(f"No data files found in {data_path}")
         data_files.sort()
 
-        # Log source sizes
         for dir_name, (paths, _) in glob_results.items():
-            logger.debug(f"Source {dir_name}: {len(paths)} files")
+            logger.debug(f"Source {dir_name} @ {data_path.parent}: {len(paths)} files")
 
-        # Build path sets for non-primary sources
         other_path_sets = {
             dir_name: path_set for dir_name, (_, path_set) in glob_results.items() if dir_name != data_key
         }
 
-        # Pass 2: For each primary file, check if expected paths exist in other sources' sets
         sample_files: dict[str, list[Path]] = {output_key: [] for output_key in self.data_sources.values()}
         valid_count = 0
-
         for data_file in data_files:
             rel_path = data_file.relative_to(data_path)
-
-            # Check all other sources via set lookup (O(1) per source, no stat calls)
             all_exist = True
             for dir_name, path_set in other_path_sets.items():
-                expected = self._get_expected_file_path(dir_name, data_file, rel_path)
+                expected = self._get_expected_file_path(source_paths, dir_name, data_file, rel_path)
                 if str(expected) not in path_set:
                     logger.debug(f"Skipping {data_file.name}: no matching {dir_name} file at {expected}")
                     all_exist = False
                     break
-
             if all_exist:
-                self._fill_sample_data_files(data_file, rel_path, sample_files)
+                self._fill_sample_data_files(source_paths, data_file, rel_path, sample_files)
                 valid_count += 1
 
         skipped = len(data_files) - valid_count
         if skipped > 0:
-            logger.info(f"Fast index: {valid_count} valid samples from {len(data_files)} total ({skipped} skipped)")
-        else:
-            logger.debug(f"Fast index: {valid_count} valid samples from {len(data_files)} total")
-
+            logger.info(
+                f"Fast index @ {data_path.parent}: {valid_count} valid from {len(data_files)} ({skipped} skipped)"
+            )
         return sample_files
 
-    def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path) -> Path:
-        """Get the expected file path for a given data source."""
-        source_path = self.source_paths[dir_name]
+    @staticmethod
+    def _get_expected_file_path(
+        source_paths: dict[str, Path], dir_name: str, data_file: Path, rel_path: Path
+    ) -> Path:
+        """Absolute path of the file in `dir_name` that corresponds to `data_file`."""
+        source_path = source_paths[dir_name]
 
         # For conditions, handle legacy naming where latent_X.pt maps to condition_X.pt
         if dir_name == "conditions" and data_file.name.startswith("latent_"):
@@ -237,18 +254,24 @@ class PrecomputedDataset(Dataset):
 
         return source_path / rel_path
 
-    def _fill_sample_data_files(self, data_file: Path, rel_path: Path, sample_files: dict[str, list[Path]]) -> None:
-        """Add a valid sample to the sample_files tracking."""
+    def _fill_sample_data_files(
+        self,
+        source_paths: dict[str, Path],
+        data_file: Path,
+        rel_path: Path,
+        sample_files: dict[str, list[Path]],
+    ) -> None:
+        """Append one valid sample (ABSOLUTE paths) across all output keys, in lockstep."""
         for dir_name, output_key in self.data_sources.items():
-            expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
-            sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
+            expected_path = self._get_expected_file_path(source_paths, dir_name, data_file, rel_path)
+            sample_files[output_key].append(expected_path)
 
     def _validate_setup(self) -> None:
         """Validate that the dataset setup is correct."""
         sample_counts = {key: len(files) for key, files in self.sample_files.items()}
         if not sample_counts or all(count == 0 for count in sample_counts.values()):
             raise ValueError(
-                f"No valid samples found in {self.data_root} - all configured data sources "
+                f"No valid samples found in {self.data_roots} - all configured data sources "
                 f"({list(self.data_sources)}) must have matching files (per-source counts: {sample_counts})"
             )
 
@@ -265,9 +288,7 @@ class PrecomputedDataset(Dataset):
         result = {}
 
         for dir_name, output_key in self.data_sources.items():
-            source_path = self.source_paths[dir_name]
-            file_rel_path = self.sample_files[output_key][index]
-            file_path = source_path / file_rel_path
+            file_path = self.sample_files[output_key][index]  # absolute (possibly cross-root)
 
             try:
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
