@@ -6,6 +6,57 @@ Entries are in reverse chronological order.
 
 ---
 
+## 2026-07-28 — Perceptual Flow Matching loss for the tomato_sauce arms + a silent MSE-regression bug, and a repo cleanup
+
+Three things happened over 2026-07-27/28: (1) we swapped the trainer's latent-space velocity MSE for a **Perceptual Flow Matching (PFM)** loss on the `tomato_sauce` active-learning arms, (2) we caught and fixed a bug where PFM was *silently* dropping back to MSE on every watchdog resubmit, and (3) we archived ~95 dead/superseded files out of `experiments/libero_sim` and `experiments/droid_action_cond` without disturbing the live run.
+
+### 1. PFM loss (opt-in, env-gated)
+
+Motivation: the standard flow-matching objective regresses the velocity `v = ε − x₀` in VAE-latent space with masked MSE, which is mean-seeking (blurry, weak on few-step generation). **Perceptual Flow Matching** ([arXiv 2607.03524](https://arxiv.org/abs/2607.03524)) instead supervises the *recovered clean prediction* in a frozen perceptual feature space, shifting the regression toward mode-seeking (sharper). Matrix-Game 3.5 — a PRoPE video world model — uses PFM during its causal adaptation, which is a direct precedent for our setup. (Their repo is inference-only; this is implemented from the paper, not copied.)
+
+What it computes, per training step, when `PFM_ENABLE=1`:
+1. Recover the clean latent from the model's predicted velocity: `x̂₀ = x_t − σ·v_pred` (and the GT `x₀ = x_t − σ·v_true`), on the target tokens only (conditioning tokens are pinned to GT).
+2. Unpatchify both back to the `(B, 128, F, H, W)` latent grid.
+3. Decode both through the **frozen VAE decoder, in the autograd graph, on GPU**.
+4. Match the two in **DINOv2 ViT-S/14** feature space (imagenet-normalised, 224-interpolated): `‖φ(x̂₀_px) − φ(x₀_px)‖²`.
+
+`PFM_MSE_WEIGHT` lets you blend the old latent MSE back in (`0.0` = pure replacement, which is what the arms run). `PFM_FRAMES` optionally decodes a frame subset. It's gated by env, matching the existing `AL_V2` flag pattern, so `PFM_ENABLE=0` (default) is byte-identical to the old trainer.
+
+| File | Change |
+|---|---|
+| `packages/ltx-trainer/src/ltx_trainer/trainer.py` | `_pfm_enabled` / `_ensure_pfm` / `_dino_feats` / `_perceptual_loss`; perceptual term added at the loss site in `_training_step`; VAE decoder kept **on GPU** (not CPU-offloaded) when PFM is on |
+| `.../training_strategies/base_strategy.py` | `ModelInputs.video_latent_grid: (F,H,W)` — needed to unpatchify `x̂₀` |
+| `.../training_strategies/video_to_video.py` | populates `video_latent_grid` before patchify |
+| `experiments/libero_sim/configs/active_learning_tomato_sauce.env` | `PFM_*` block |
+
+Perceptual model is DINOv2 ViT-S/14 loaded from the **offline** torch-hub cache (`~/.cache/torch/hub/`), no download. Validated before launch: isolated memory smoke = full 33-frame decode + DINOv2 + backward is ~6 GB extra on an H200; a 2-step end-to-end smoke on the real 22B model trained through the full path with no OOM. Cost: **~2× slower per step** (~0.18 vs ~0.34 steps/s) — the full-clip decode + DINOv2 runs every microbatch.
+
+### 2. The silent MSE-regression bug (and the real fix)
+
+**Symptom.** After relaunch, the arms *looked* like they were training with PFM, but weren't: no `PFM: VAE decoder kept on GPU` banner in the logs, and steady-state **2.8 s/step = the MSE speed**, not PFM's ~5.5 s/step. Only the very first job launched right after the watchdog started had the banner; every subsequent watchdog *resubmit* had regressed to plain MSE — while still correctly carrying the other `.env` knobs (`SCORER=objbbox`, the custom `poke:10` mix).
+
+**Root cause.** The watchdog sources the arm config **once at startup** (`set -a; source cfg; set +a`) and relies on `sbatch --export=ALL` to carry those vars into each job. `PFM_ENABLE` was reaching the *job's* environment inconsistently across resubmits (a stale/partial submitting-env → `--export=ALL` chain), so `train.py` saw `PFM_ENABLE` unset and ran the default (MSE). The failure is silent because the loss switch is a no-op fallback, not an error.
+
+**Fix — make the job source its config itself, not trust the export chain.** The arm sbatch now re-sources the config `.env` at *job* time, so every knob (`PFM_*`, `SCORER`, mix, …) is authoritative from the file regardless of what the submitting process had. The watchdog passes its config path as `AL_CONFIG` (both `export AL_CONFIG` and explicitly in the `--export` list). `VERSIONS` is set per-arm via `--export` and is *not* in the `.env`, so it survives the re-source.
+
+- `experiments/libero_sim/run_active_learning.sbatch` — sources `${AL_CONFIG}` after conda activate; logs `[sbatch] sourcing arm config: …`
+- `experiments/libero_sim/monitor_active_tomato_sauce.sh` — `export AL_CONFIG="$CONFIG"` + `--export=ALL,VERSIONS=…,AL_CONFIG=…`
+
+**Operational lesson (already knew, re-confirmed):** a *running* watchdog does **not** re-source `.env` edits — you must restart it. When the watchdog process later died on its own, the arms were left queued with no babysitter; the recovery was to cancel the stale (PENDING, zero-compute-lost) MSE jobs and restart the watchdog fresh, which resubmitted all four with PFM, resuming from their latest checkpoints (rand 38000, maxloss/decaware 35250, rho_div 34000).
+
+> **Caveat on the resulting run.** Because PFM was activated mid-schedule (resume, not clean restart from step 30000), steps 30000→~35–38k were MSE-trained and the remainder is PFM — a mixed trajectory. This is a "does PFM sharpen the WM" run, **not** a clean cross-arm AL ablation. A pure-PFM-from-30000 restart is available if the comparison needs to be airtight; it was deferred to avoid discarding the warm-started checkpoints.
+
+### 3. Repo cleanup (experiments/ decluttered, live pipeline untouched)
+
+`experiments/libero_sim` and `experiments/droid_action_cond` had accumulated ~40 and ~30 top-level scripts. We mapped the **live `tomato_sauce` dependency set** (17 files in `libero_sim` + 2 in `droid_action_cond` — the latter, `build_dataset_resumable.py` and `chunk_context.py`, are pulled into the LIBERO run via `sys.path.insert`) and left every one of them in place, then moved everything else into a structured `archive/`:
+
+- `libero_sim/archive/{eval,builds,al_experiments,smoke,bench,infer,misc}/` (63 files)
+- `droid_action_cond/archive/{wrist_calib,wrist_compare,demos,dataset_variants}/` (33 files)
+
+Guiding rule: **the running experiment must not break**, so the import-coupled live pipeline stays at top level (moving a file the loop subprocess-calls by path, or a sibling it imports, would break an in-flight round). Verified post-move that every subprocess/import target the live loop references still resolves. Also deleted 8 stray `*.out` logs from the repo root and `libero_sim/`. A deeper functional reorg of the live pipeline itself (into `build/`, `scoring/`, … subdirs) is deferred — it would require moving import-coupled files and a coordinated restart, and the payoff didn't justify the breakage risk while the arms are running.
+
+---
+
 ## 2026-07-08 — Active learning result: object-single AL is a null, and why (pivot to decision-aware WM)
 
 The object-centric single-scene active-learning experiment came back **negative-to-null**, and the diagnosis reframes the whole direction. Recording the result, the evidence, and the literature-backed conclusion so we don't re-run this configuration.
